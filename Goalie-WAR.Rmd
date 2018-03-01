@@ -1,0 +1,191 @@
+
+### Create goalie prior
+
+```{r}
+
+load("~/Documents/CWA/Hockey Data/goalie_shot_level_prep.RData")
+
+goalie_season_results <- goalie_shot_level_prep %>%
+  group_by(SA_Goalie, SA_Goalie_Id, season) %>%
+  summarise(NonRebound_Shots = sum(NonRebound_Shot),
+            GA = sum(Goal),
+            Age = mean(Age),
+            xG_total = sum(xG_FirstShot) + sum(xR * rebound_goal_probability),
+            replacement_GA = (NonRebound_Shots * ( - replacement_lift)) + xG_total,
+            xG_lift_shot = (xG_total - GA) / NonRebound_Shots) %>%
+  group_by(SA_Goalie, SA_Goalie_Id) %>%
+  mutate(lag_season_xG_lift = lag(xG_lift_shot),
+         lag_NonRebound_Shots = lag(NonRebound_Shots),
+         rookie = ifelse(is.na(lag_NonRebound_Shots),1,0),
+         lag_NonRebound_Shots = ifelse(is.na(lag_NonRebound_Shots),0,lag_NonRebound_Shots),
+         lag_season_xG_lift = ifelse(is.na(lag_season_xG_lift),replacement_lift,lag_season_xG_lift) )
+
+season_model_data <- goalie_season_results %>%
+  na.omit() %>%
+  ungroup() %>%
+  select(xG_lift_shot, Age, rookie, lag_NonRebound_Shots, lag_season_xG_lift)
+
+## Cross-validation
+train_control <- trainControl(method="cv", number=5,  allowParallel = TRUE)
+mtry <- sqrt(ncol(goalie_season_results))
+tunegrid <- expand.grid(.mtry=mtry)
+
+## Model, penaltized logistic regression
+prior_model <- caret::train(xG_lift_shot ~ .,
+                            data = season_model_data,
+                            trControl=train_control, 
+                            #tuneGrid=tunegrid,
+                            method="lm"
+)   
+
+Metrics::rmse(season_model_data$xG_lift_shot, predict(prior_model, season_model_data))
+
+
+plot(season_model_data$xG_lift_shot, predict(prior_model, season_model_data))
+
+
+goalie_season_result_wPred <- data.frame(cbind(season_predicted_lift = predict(prior_model, goalie_season_results), goalie_season_results))
+
+```
+
+## Regress Function
+
+```{r}
+
+## Beta Functions
+calcBetaMode <- function(aa, bb) { BetaMode <- (aa - 1)/(aa + bb - 2); return(BetaMode); }
+calcBetaMean <- function(aa, bb) { BetaMean <- (aa)/(aa + bb); return(BetaMean); }
+calcBetaSd   <- function(aa, bb) { BetaSd <- sqrt((aa * bb)/(((aa + bb)^2) * (aa + bb + 1))); return(BetaSd); }
+
+
+bayes_regress_fun <- function(reg_xSv, GA, Shots, prior_lift, prior) {
+  
+  beta_a = (reg_xSv + prior_lift) * prior
+  beta_b = prior - beta_a
+  
+  # Overall
+  likelihood_a = sum(Shots) - sum(GA) + 1  ## Saves + 1
+  likelihood_b = sum(GA) + 1  ## Goals + 1
+  
+  posterior_a = beta_a + (likelihood_a - 1)  ## Success + Beta A
+  posterior_b = beta_b +  (likelihood_b - 1)  ## Goals + Beta B
+  
+  prior_mean      = calcBetaMean(beta_a, beta_b)
+  posterior_mean  = calcBetaMean(posterior_a, posterior_b)
+  
+  out  = calcBetaMean(posterior_a, posterior_b) 
+  
+  
+  return(out)
+}
+
+## Test Priors 
+
+test_prior_shots <- seq(100, 6100, by = 500)
+
+simple_model_results <- vector(length = length(test_prior_shots))
+wt_corr_results <- vector(length = length(test_prior_shots))
+
+for(i in 1:length(test_prior_shots)) {
+  
+  goalie_day_level <- goalie_shot_level_prep %>%
+    group_by(SA_Goalie, SA_Goalie_Id, season, Date, Game_Id, Age) %>%
+    summarise(NonRebound_Shots = sum(NonRebound_Shot),
+              GA = sum(Goal),
+              xG_total = sum(xG_FirstShot) + sum(xR * rebound_goal_probability),
+              replacement_GA = (NonRebound_Shots * ( - replacement_lift)) + xG_total) %>%
+    group_by(SA_Goalie, SA_Goalie_Id, season) %>%
+    mutate(total_season_shots = sum(NonRebound_Shots),
+           cum_season_shots = cumsum(NonRebound_Shots),
+           cum_season_xSv = (cum_season_shots - cumsum(xG_total)) / cum_season_shots,
+           cum_season_regressed_xSv = ((cum_season_shots + test_prior_shots[i]) - (cumsum(xG_total) + (test_prior_shots[i] * mean(goalie_shot_level_prep$Goal)))) / (cum_season_shots + test_prior_shots[i]),
+           cum_season_Sv = (cum_season_shots - cumsum(GA)) / cum_season_shots,
+           season_games = uniqueN(Game_Id)) %>%
+    left_join(goalie_season_result_wPred %>% select(SA_Goalie_Id, season, season_predicted_lift), by = c("SA_Goalie_Id", "season")) %>%
+    mutate(cum_season_pSv = bayes_regress_fun(cum_season_xSv, cumsum(GA), cum_season_shots, season_predicted_lift,test_prior_shots[i]),
+           cum_lift = (cum_season_Sv - cum_season_xSv) * 100,
+           cum_regressed_lift = (cum_season_pSv - cum_season_xSv) * 100
+           )
+  
+  goalie_results <- goalie_day_level %>%
+    group_by(SA_Goalie, season) %>%
+    summarise(bayes_regressed_lift = weighted.mean(cum_regressed_lift,NonRebound_Shots),
+              season_shots = sum(NonRebound_Shots),
+              Age = mean(Age),
+              season_predicted_lift = mean(season_predicted_lift)) %>%
+    group_by(SA_Goalie) %>%
+    mutate(lag_bayes_regressed_lift = lag(bayes_regressed_lift),
+           lag_shots = lag(season_shots),
+           total_shots = lag(season_shots) + season_shots) %>%
+    na.omit()
+  
+  simple_model_results[i] <- summary(lm(data=goalie_results, bayes_regressed_lift ~ lag_shots + lag_bayes_regressed_lift +  Age + season_predicted_lift))$r.squared
+  
+   wt_corr_results[i] <- psych::cor.wt(data=goalie_results[c("bayes_regressed_lift","lag_bayes_regressed_lift")], w = goalie_results$total_shots)[[1]][1,2]
+
+}
+
+```
+
+### Plot Priors
+
+```{r}
+
+data.frame(cbind(test_prior_shots, simple_model_results, wt_corr_results)) %>%
+      melt(id.vars = "test_prior_shots") %>%
+      ggplot(aes(x=test_prior_shots, y=value, color=variable)) +
+      geom_line() +
+      theme_standard() +
+      ylim(0,NA)
+
+```
+
+## Use Ideal Prior
+
+```{r}
+
+best_prior <- 6000
+
+replacement_lift <- 0.01207521
+
+goalie_day_level <- goalie_shot_level_prep %>%
+  group_by(SA_Goalie, SA_Goalie_Id, season, Date, Game_Id, Age) %>%
+  summarise(NonRebound_Shots = sum(NonRebound_Shot),
+            GA = sum(Goal),
+            xG_total = sum(xG_FirstShot) + sum(xR * rebound_goal_probability)) %>%
+  group_by(SA_Goalie, SA_Goalie_Id, season) %>%
+  mutate(total_season_shots = sum(NonRebound_Shots),
+         cum_season_shots = cumsum(NonRebound_Shots),
+         cum_season_xSv = (cum_season_shots - cumsum(xG_total)) / cum_season_shots,
+         cum_season_regressed_xSv = ((cum_season_shots + best_prior) - (cumsum(xG_total) + (best_prior * mean(goalie_shot_level_prep$Goal)))) / (cum_season_shots + best_prior),
+         cum_season_Sv = (cum_season_shots - cumsum(GA)) / cum_season_shots,
+         season_games = uniqueN(Game_Id)) %>%
+  left_join(goalie_season_result_wPred %>% select(SA_Goalie_Id, season, season_predicted_lift), by = c("SA_Goalie_Id", "season")) %>%
+  mutate(cum_season_pSv = bayes_regress_fun(cum_season_xSv, cumsum(GA), cum_season_shots, season_predicted_lift,test_prior_shots[i]),
+         cum_lift = (cum_season_Sv - cum_season_xSv) * 100,
+         cum_regressed_lift = (cum_season_pSv - cum_season_regressed_xSv) * 100
+         ) %>%
+  group_by(SA_Goalie, SA_Goalie_Id) %>%
+  mutate(career_games = n(),
+         gameday_estimated_ability = ifelse(career_games <= 20 | season_games <=3,
+                                        replacement_lift,
+                                      ifelse(season != lag(season),
+                                        season_predicted_lift,     
+                                      ifelse(is.na(lag(cum_regressed_lift)),
+                                            0,
+                                      lag(cum_regressed_lift / 100)))))
+
+```
+
+### Plot Goalies
+
+```{r}
+
+goalie_day_level %>%
+    filter(SA_Goalie == "TUUKKA RASK") %>%
+    ggplot(aes(x=as.Date(Date), y=gameday_estimated_ability, color=as.factor(season))) +
+    geom_line() +
+    geom_hline(yintercept = 0, color="grey50") +
+    theme_standard()
+    
+```    
