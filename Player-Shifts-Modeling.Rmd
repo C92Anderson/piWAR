@@ -1,0 +1,525 @@
+
+
+### Join Shift Level Data
+
+```{r}
+
+load("~/Documents/CWA/Hockey Data/skater_shift_level_1418.RData")
+load("~/Documents/CWA/Hockey Data/goalie_day_level.RData")
+
+penalty_xG <- 0.17
+
+### Join & Create target variable
+skater_shift_level <-skater_shift_level_1418 %>%
+        mutate(Impacts = as.factor(ifelse(GF > 0,"teamGoalFor",
+                         ifelse(GA > 0,"teamGoalAgainst",
+                         ifelse(PenTake > 0,"teamPenTake",
+                         ifelse(PenDraw > 0,"teamPenDrawn",
+                                "NA"))))),
+               Production = as.factor(ifelse(iG > 0,"iGoal",
+                            ifelse(iP1 > 0,"iAssist1",
+                            ifelse(iP > 0,"iAssist2",
+                                  "NA")))),
+               Points1 = iG + iP1,
+               Points2 = iG + iP,
+               Penalty = as.factor(ifelse(iPenDraw > 0,"iPenDrawn",
+                         ifelse(iPenTake > 0,"iPenTake",
+                                  "NA"))),
+               xGF_total = 0 + xGF + (PenDraw * penalty_xG),
+               xGA_total = 0 + xGA + (PenTake * penalty_xG)) %>% 
+      na.omit() %>%
+      rename(Score_State0 = Score_State) %>%
+      group_by(Player, Player_Id, season, Game_Id) %>%
+      mutate(Score_State = ifelse(is.na(lag(Score_State0)),0,lag(Score_State0))) %>%
+      ungroup()
+
+skater_shift_level$Impacts <- relevel(skater_shift_level$Impacts, ref = "NA")
+skater_shift_level$Production <- relevel(skater_shift_level$Production, ref = "NA")
+skater_shift_level$Penalty <- relevel(skater_shift_level$Penalty, ref = "NA")
+
+
+skater_shift_level %>% group_by(Impacts) %>% summarise(Cnt = n()) %>% group_by() %>% mutate(Share = Cnt / sum(Cnt)) %>% arrange(-Cnt)
+
+skater_shift_level %>% group_by(Production,Penalty) %>% summarise(Cnt = n()) %>% group_by() %>% mutate(Share = Cnt / sum(Cnt)) %>% arrange(-Cnt)
+
+skater_shift_level %>% group_by(Points1, Points2, Production) %>% summarise(cnt = n())
+
+
+skater_shift_level %>%
+    select(xGF_total, xGA_total) %>%
+    melt() %>%
+    ggplot(aes(x=value, color=variable)) +
+    geom_density()
+
+skater_shift_level %>%
+    select(xGF_total, xGA_total) %>%
+    melt() %>%
+    ggplot(aes(x=value, color=variable)) +
+    geom_density()
+
+quality_features <- skater_shift_level %>%
+    select(ends_with("Competition"), ends_with("Teammates")) %>%
+    melt() %>%
+    ggplot(aes(x=value, fill=variable)) +
+    geom_density(alpha=0.3, color="grey80") +
+    theme_standard() +
+    ggthemes::scale_fill_gdocs() +
+    labs(title="Player-Shift Level Teammate and Competition Quality",x="Estimated Ability",fill="Metric")
+
+
+ggsave(filename="/Users/colander1/Downloads/quality_features.png", plot=quality_features,  width=16, height=12)
+
+```
+
+## Preprocess, Split
+
+```{r}
+
+load("~/Documents/CWA/Hockey Data/player_level_quality.RData")
+
+skater_shift_level_clean <- skater_shift_level %>% 
+      left_join(unique(player_level_quality[c("shooterID","Pos")]), by = c("Player_Id"="shooterID")) %>%
+      select(xGF_total, xGA_total, Player_Venue,Score_State,Off_FO_Shift, Def_FO_Shift,OTF_Shift,Strength_State, Mean_Teammates , Mean_Competition, #Max_Teammates, Max_Competition,Min_Teammates, Min_Competition, 
+             Pos) %>%
+      mutate(Player_Venue = as.factor(Player_Venue),
+             Off_FO_Shift = as.factor(Off_FO_Shift),
+             Def_FO_Shift = as.factor(Def_FO_Shift),
+             OTF_Shift = as.factor(OTF_Shift),
+             Pos = as.factor(Pos))
+
+model_features <- skater_shift_level_clean %>% select(-starts_with("xG"))
+
+## Scale and Center
+#preProcValues <- preProcess(model_features, method = c("center", "scale"))
+#model_features1 <- predict(preProcValues, model_features) 
+
+## Dummy Variable
+dmy <- dummyVars(" ~ .", data = model_features,fullRank = T)
+input_data <- data.frame(predict(dmy, newdata = model_features))
+
+feature_list <- colnames(input_data)
+
+model_data <- input_data %>%
+      mutate(xGF_total = skater_shift_level_clean$xGF_total,
+             xGA_total = skater_shift_level_clean$xGA_total)
+
+```
+
+## I need the following models, will first create vectors
+1. Team GF On-Ice
+2. Team GA On-Ice
+3. Team Penalties Drawn
+4. Team Penalties Taken
+
+5. Individual Goals Scored
+6. Individual Primary Assists
+7. Individual Secondary Assists
+
+8. Individual Penalties Drawn
+9. Individual Penalties Taken
+
+10. Team xGF On-Ice
+11. Team xGA On-Ice
+
+```{r}
+
+tGF <- factor(ifelse(skater_shift_level$GF > 0,1,0))
+tGA <- factor(ifelse(skater_shift_level$GA > 0,1,0))
+tPD <- factor(ifelse(skater_shift_level$PenDraw > 0,1,0))
+tPT <- factor(ifelse(skater_shift_level$PenTake > 0,1,0))
+
+iG <- factor(ifelse(skater_shift_level$iG > 0,1,0))
+iA1 <- factor(ifelse(skater_shift_level$iP1 - skater_shift_level$iG > 0,1,0))
+iA2 <- factor(ifelse(skater_shift_level$iP - skater_shift_level$iP1 > 0,1,0))
+
+iPD <- factor(ifelse(skater_shift_level$iPenDraw > 0,1,0))
+iPT <- factor(ifelse(skater_shift_level$iPenTake > 0,1,0))
+
+txGF <- skater_shift_level$xGF_total
+txGA <- skater_shift_level$xGA_total
+
+```
+
+### Final Production Model
+
+```{r}
+set.seed(7)
+# configure multicore
+library(doMC)
+registerDoMC(cores=4)
+
+logistic_model <- function(target_vec, gf_vec = FALSE, nm) {
+    
+    ## Cross-validation
+    train_control <- trainControl(method="cv", number=5,  allowParallel = TRUE)
+                      
+    ## Lambda gird   
+    grid <- expand.grid(lambda=seq(0,1,by=0.2), cp = c("aic", "bic"))
+    
+    model_data2 <- data.frame(cbind(target = target_vec,
+                                                           tGF,
+                                                           model_data[feature_list])) %>% 
+                    select(ifelse(gf_vec == FALSE,-starts_with("tGF"),starts_with("null"))) %>%
+                    head(10000) %>%
+                    as.data.frame()
+    
+    print(head(model_data2))
+    
+    ## Model, penaltized logistic regression
+    model <- caret::train(target ~ .,
+                                   data = model_data2,
+                                   trControl=train_control, 
+                                   tuneGrid=grid,
+                                    method="plr"
+                               )  #method="glm", family="binomial") metric="LogLoss","#metric="ROC"#,
+						                       
+    ## Output variable imporance
+    variable_importance <- varImp(model)
+                
+    ## Output predicted values
+    predicted <- predict(model, model_data2,type="prob")$`1`
+
+    ## Print results
+    niave_ll <- Metrics::logLoss(as.numeric(target_vec)-1,mean(as.numeric(target_vec)-1))
+    model_ll <- Metrics::logLoss(as.numeric(target_vec)-1,predicted)
+    lift <- round((niave_ll - model_ll) / niave_ll,4)
+    
+    print(paste0(nm," Model, Baseline Logloss: ",round(niave_ll,4),"Model Logloss: ",round(model_ll,4),"Lift: ",lift))
+    
+    ## Save Model
+    saveRDS(model, paste0("/Users/colander1/Documents/CWA/Hockey Data/WARData/",nm,"_model.rds"))
+    
+    return(list(model,variable_importance, predicted))
+    
+}
+
+iG_output <- logistic_model(iG, TRUE,"iG") # 0.04143627
+
+
+tGF_output <- logistic_model(tGF, FALSE,"tGF")
+#tGA_output <- logistic_model(tGA, FALSE,"tGF")
+tPD_output <- logistic_model(tPD, FALSE,"tPD")
+tPT_output <- logistic_model(tPT, FALSE,"tPT")
+
+iA1_output <- logistic_model(iA1, TRUE,"iA1") # 0.04174799
+iA2_output <- logistic_model(iA2, TRUE,"iA2") # 0.0426679
+
+iPD <- logistic_model(iPD, FALSE,"iPD")
+iPT <- logistic_model(iPT, FALSE,"iPT")
+
+```
+## Goal Impact Model
+
+```{r}
+print(Metrics::logLoss(GF,mean(GF))) #0.1466301
+print(Metrics::logLoss(GA,mean(GA))) #0.1584036
+
+goal_impact_model <- function(target_vec) {
+    
+    ## Cross-validation
+    train_control <- trainControl(method="cv", number=5,  allowParallel = TRUE)
+                      
+    ## Lambda gird   
+    grid <- expand.grid(lambda=seq(0,1,by=0.2), cp = c("aic", "bic"))
+    
+    ## Model, penaltized logistic regression
+    impact_model <- caret::train(target ~ .,
+                                   data = data.frame(cbind(target = as.factor(target_vec),
+                                                           model_data[feature_list])), 
+                                   trControl=train_control, 
+                                   tuneGrid=grid,
+                                    method="plr"
+                               )  #method="glm", family="binomial") metric="LogLoss","#metric="ROC"#,
+						                       
+    ## Output variable imporance
+    variable_importance <- varImp(impact_model)
+                     
+    ## Output predicted values
+    predicted <- predict(impact_model, model_data,type="prob")$`1`
+
+    ## Print results
+    print(Metrics::logLoss(target_vec,predicted))
+    
+    return(list(impact_model,variable_importance, predicted))
+    
+}
+
+GF_output <- goal_impact_model(GF) # 0.04143627
+GA_output <- goal_impact_model(GA) # 0.04143627
+
+```
+
+## Expected Goals 
+
+```{r}
+print(Metrics::rmse(skater_shift_level$xGF,mean(skater_shift_level$xGF)))
+print(Metrics::rmse(skater_shift_level$xGA,mean(skater_shift_level$xGA)))
+
+goal_impact_model <- function(target_vec) {
+    
+    ## Cross-validation
+    train_control <- trainControl(method="cv", number=5,  allowParallel = TRUE)
+                      
+    ## Lambda grid   
+    #grid <- expand.grid(lambda=seq(0,1,by=0.2), cp = c("aic", "bic"))
+    
+    ## Model, penaltized logistic regression
+    xG_impact_model <- caret::train(target ~ .,
+                                   data = data.frame(cbind(target = target_vec,
+                                                           model_data[feature_list])) %>% head(10000), 
+                                   trControl=train_control, 
+                                   #tuneGrid=grid,
+                                    method="glm"
+                               )
+						                       
+    ## Output variable imporance
+    variable_importance <- varImp(xG_impact_model)
+                     
+    print(variable_importance)
+    ## Output predicted values
+    predicted <- predict(xG_impact_model, model_data,type="prob")$`1`
+
+    ## Print results
+    print(Metrics::rmse(target_vec,predicted))
+    
+    return(list(xG_impact_model,variable_importance, predicted))
+    
+}
+
+xGF_output <- goal_impact_model(skater_shift_level$xGF) # 0.04143627
+xGA_output <- goal_impact_model(skater_shift_level$xGA) # 0.04143627
+
+```
+
+## XGBoost
+
+
+```{r}
+
+## xGD 
+index <- createDataPartition(model_data$xGF_total, p=0.75, list=FALSE)
+train_data <- xgb.DMatrix(as.matrix(model_data[index,feature_list]),label=model_data[ index,c("xGF_total")] - model_data[ index,c("xGA_total")])
+test_data <- xgb.DMatrix(as.matrix(model_data[-index,feature_list]),label=model_data[-index,c("xGF_total")] - model_data[ -index,c("xGA_total")])
+
+xGD_bst <- xgb.train( params = list(objective = "reg:gamma",
+            #booster = "gblinear", 
+            eta = 0.05,   # step size / shrinkage
+            max_depth = 6,  # Max depth of each tree
+            gamma = 0,    # Minimum loss function for leaf to be split
+            min_child_weight = 20,    # Min number of cases in leaf
+            subsample = 0.3,    # Sample of cases for each tree
+            colsample_bytree = 0.7,  # Ratio of columns to sample
+            missing = NA,
+            stratified = TRUE,
+            nthread = 2,   # maximum number of cores/ threads to use for training
+            early_stopping_rounds = 5,  # set to value of consecutive worse performance to terminate
+            nfold = 5,
+            base_score = 0,
+            prediction = TRUE,
+            verbose = 1,
+            metrics = "rmse"),
+            train_data, nrounds = 25, list(eval = test_data, train = train_data))
+
+xGD_importance_matrix <- xgb.importance(feature_names = feature_list, model = xGD_bst)
+
+xGD_importance_plot = xgb.plot.importance(xGD_importance_matrix)
+print(xGD_importance_plot) 
+
+## xGA Importance
+train_data <- xgb.DMatrix(as.matrix(model_data[index,feature_list]),label=model_data[ index,c("xGA_total")])
+test_data <- xgb.DMatrix(as.matrix(model_data[-index,feature_list]),label=model_data[-index,c("xGA_total")])
+
+# linear booster eval-rmse:0.125505	train-rmse:0.125242 
+
+
+```
+
+```{r}
+library(xgboost)
+
+xgbparams <- list(objective = "reg:gamma",
+              eta = 0.05,   # step size / shrinkage
+              seed = 1,
+              early_stopping_rounds = 50,
+              max_depth = 6,  # Max depth of each tree
+              gamma = 0,    # Minimum loss function for leaf to be split
+              min_child_weight = 20,    # Min number of cases in leaf
+              subsample = 0.3,    # Sample of cases for each tree
+              colsample_bytree = 0.7,  # Ratio of columns to sample
+              missing = NA,
+              prediction = TRUE,
+              base_score = 0,
+              nthread = 2,   # maximum number of cores/ threads to use for training
+              verbose = 1,
+              print_every_n = 5   # set how often to print performance when verbose > 0
+              )
+
+## Expected Goal For Model
+xGF_impact_model <- xgb.cv(data = xgb.DMatrix(as.matrix(model_data[feature_list]),label = model_data$xGF_total), 
+                    nrounds = 20,
+                    params = xgbparams,
+                    nfold = 5,
+                    metrics = "rmse")
+
+
+## Expected Goal Against Model
+xGA_impact_model <- xgb.cv(data = xgb.DMatrix(as.matrix(model_data[feature_list]),label = model_data$xGA_total), 
+                    nrounds = 50,
+                    params = xgbparams,
+                    nfold = 5,
+                    metrics = "rmse")
+
+
+```
+
+### Check RSME, MAE
+
+```{r}
+
+## xGF Importance
+index <- createDataPartition(model_data$xGF_total, p=0.75, list=FALSE)
+train_data <- xgb.DMatrix(as.matrix(model_data[index,feature_list]),label=model_data[ index,c("xGF_total")])
+test_data <- xgb.DMatrix(as.matrix(model_data[-index,feature_list]),label=model_data[-index,c("xGF_total")])
+
+xGF_bst <- xgb.train(xgbparams, train_data, nrounds = 10, list(eval = test_data, train = train_data))
+
+xGF_importance_matrix <- xgb.importance(feature_names = feature_list, model = xGF_bst)
+
+xGF_importance_plot = xgb.plot.importance(xGF_importance_matrix)
+print(xGF_importance_plot) 
+
+## xGA Importance
+train_data <- xgb.DMatrix(as.matrix(model_data[index,feature_list]),label=model_data[ index,c("xGA_total")])
+test_data <- xgb.DMatrix(as.matrix(model_data[-index,feature_list]),label=model_data[-index,c("xGA_total")])
+
+xGA_bst <- xgb.train(xgbparams, train_data, nrounds = 10, list(eval = test_data, train = train_data))
+
+xGA_importance_matrix <- xgb.importance(feature_names = feature_list, model = xGA_bst)
+
+xGA_importance_plot = xgb.plot.importance(xGA_importance_matrix)
+print(xGA_importance_plot) 
+
+
+predicted_scored <- as.data.frame(cbind(xGF_impacts_probs = predict(xGF_bst, test_data), 
+                                        xGF_total = model_data[-index,c("xGF_total")],
+                                        xGA_impacts_probs = predict(xGA_bst, test_data), 
+                                        xGA_total = model_data[-index,c("xGA_total")]))
+
+
+sum(predicted_scored$xGF_impacts_probs) - sum(predicted_scored$xGF_total)
+
+sqrt(mean((predict(xGF_bst, test_data) - model_data[-index,c("xGF_total")])^2))
+sqrt(mean((predict(xGA_bst, test_data) - model_data[-index,c("xGA_total")])^2))
+
+predicted_scored %>%
+      ggplot(aes(x=xGF_impacts_probs, y=xGF_total)) +
+      geom_point()
+
+```
+
+## Weighted Production
+
+```{r}
+
+
+prod_grid <- expand.grid(goal_weight = 1,
+                         pri_assists_weight = seq(1,0,-0.2),
+                         sec_assists_weight = seq(1,0,-0.2)) %>%
+            filter(pri_assists_weight > sec_assists_weight) 
+
+xgblmparams <- list(objective = "reg:gamma",
+              eta = 0.05,   # step size / shrinkage
+              max_depth = 6,  # Max depth of each tree
+              gamma = 0,    # Minimum loss function for leaf to be split
+              min_child_weight = 20,    # Min number of cases in leaf
+              subsample = 0.3,    # Sample of cases for each tree
+              colsample_bytree = 0.7,  # Ratio of columns to sample
+              missing = NA,
+              #stratified = TRUE,
+              nthread = 2,   # maximum number of cores/ threads to use for training
+              early_stopping_rounds = 5  # set to value of consecutive worse performance to terminate
+              )
+
+production_weights_df <- data.frame(matrix(ncol = 4, nrow = 0))
+
+colnames(production_weights_df) <- c("goal_weight", "pri_assists_weight", "sec_assists_weight","corr")
+  
+for(i in 1:nrow(prod_grid)) {
+  
+  print(paste0(prod_grid[i,]))
+  
+  wProduction <- (skater_shift_level$iG * prod_grid[i,1]) + ((skater_shift_level$iP1 - skater_shift_level$iG) * prod_grid[i,2]) + ((skater_shift_level$iP - skater_shift_level$iP1) * prod_grid[i,3])
+  
+  as.data.frame(wProduction) %>% group_by(wProduction) %>% summarise(cnt = n())
+  
+  
+  wProduction_model <- xgb.cv(data = xgb.DMatrix(as.matrix(model_data[model_features]),label = wProduction), 
+                    nrounds = 50,
+                    params = xgblmparams,
+                    objective = "reg:linear",
+                    nfold = 5,
+                    base_score = 0,
+                    prediction = TRUE,
+                    verbose = 0,
+                    metrics = "rmse")  
+  
+  #print(sum(wProduction_model$pred) - sum(wProduction))
+  
+  player_production <- data.frame(wProduction = wProduction,
+                                  xwProduction = wProduction_model$pred,
+                                  Player = skater_shift_level$Player,
+                                  TOI = skater_shift_level$Duration,
+                                  Even_Shift = ifelse(skater_shift_level$Season_Shift_No %% 2 == 0,"Even_Shift","Odd_Shift")) %>%
+                        group_by(Player, Even_Shift) %>%
+                        summarise(Production = sum(wProduction) - sum(xwProduction)) %>%
+                        dcast(Player ~ Even_Shift, value.var = "Production")
+  
+  splits_cor <- cbind(prod_grid[i,],psych::cor.wt(data=player_production,vars=c("Even_Shift","Odd_Shift"), w=player_production$TOI)$r[2])
+  
+  colnames(splits_cor) <- c("goal_weight", "pri_assists_weight", "sec_assists_weight","corr")
+ 
+  production_weights_df <- rbind(production_weights_df,splits_cor)
+
+  print(splits_cor$r[2])
+  
+}
+  
+production_weights_df %>% arrange(-corr) %>% print()
+
+```
+
+## fds
+
+```{r}
+
+
+
+
+
+
+as.data.frame(wProduction) %>% group_by(wProduction) %>% summarise(cnt = n())
+
+wProduction_model <- xgb.cv(data = xgb.DMatrix(as.matrix(model_data[,c(feature_list,"xGF_total")]),label = wProduction),
+            objective = "reg:gamma",
+            params = prod_params,
+            nrounds = 50,
+            nfold = 5,
+            verbose = 1,
+            metrics = "rmse")  
+
+print(sum(wProduction_model$pred) - sum(wProduction))
+
+player_production <- data.frame(wProduction = wProduction,
+                                xwProduction = wProduction_model$pred,
+                                Player = skater_shift_level$Player,
+                                season = skater_shift_level$season,
+                                TOI = skater_shift_level$Duration,
+                                Season_Shift_No = skater_shift_level$Season_Shift_No,
+                                Even_Shift = ifelse(skater_shift_level$Season_Shift_No %% 2 == 0,"Even_Shift","Odd_Shift")) %>%
+                      group_by(Player, season) %>%
+                      summarise(`Production Lift Over Expected` = sum(wProduction) - sum(xwProduction),
+                                `Shift Count` = uniqueN(Season_Shift_No),
+                                `Production Lift Per Shift` = `Production Lift Over Expected` / `Shift Count`) 
+
+
+```

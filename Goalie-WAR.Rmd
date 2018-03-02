@@ -144,7 +144,7 @@ data.frame(cbind(test_prior_shots, simple_model_results, wt_corr_results)) %>%
 
 ```{r}
 
-best_prior <- 6000
+best_prior <- 500
 
 replacement_lift <- 0.01207521
 
@@ -168,12 +168,15 @@ goalie_day_level <- goalie_shot_level_prep %>%
   group_by(SA_Goalie, SA_Goalie_Id) %>%
   mutate(career_games = n(),
          gameday_estimated_ability = ifelse(career_games <= 20 | season_games <=3,
-                                        replacement_lift,
-                                      ifelse(season != lag(season),
-                                        season_predicted_lift,     
+                                            replacement_lift,
                                       ifelse(is.na(lag(cum_regressed_lift)),
                                             0,
-                                      lag(cum_regressed_lift / 100)))))
+                                      ifelse(season != lag(season),
+                                        season_predicted_lift,     
+
+                                            lag(cum_regressed_lift / 100)))))
+
+save(goalie_day_level, file = "~/Documents/CWA/Hockey Data/goalie_day_level.RData")
 
 ```
 
