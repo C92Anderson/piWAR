@@ -1,4 +1,56 @@
+```{r echo=FALSE}
+library(ggplot2);library(dplyr); library(DataCombine)
+library(glmnet); library(nhlscrapr); library(caret); library(RMySQL); library(readr); library(reshape2); library(rvest)
+library(httr); library(data.table); library("reshape2");
+library(ggplot2)
+library(TeachBayes)
+library(xts)
+library(RMySQL)
+library(DBI)
+library(xgboost)
+theme_set(theme_bw())
 
+start_time <- Sys.time()
+
+txt <- element_text(size = 18, colour = "grey25", face = "plain")
+bold_txt <- element_text(size = 20, colour = "navy", face = "bold")
+
+theme_standard <- function(base_size = 16, base_family = "") {
+  theme_bw(base_size = base_size, base_family = base_family) +
+    theme(
+      strip.background = element_blank(), 
+      
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank(),
+      panel.grid.major.y = element_line( colour = "white", size = 2), 
+      panel.grid.major.x = element_line( colour = "white", size = 2), 
+      
+      #strip.text.x = element_text(size = 24),
+      #strip.text.y = element_text(size = 24),
+      
+      panel.background = element_rect(fill="grey90"),
+      plot.background = element_rect(fill="grey90"),
+      legend.background = element_rect(fill="grey90"),
+      legend.key = element_rect(fill="grey90", size = 20),
+      legend.key.size = unit(1,"cm"),
+      
+      panel.border = element_blank(), 
+      
+      line = element_line( colour = "white", size = 2),
+      axis.text.x = element_text(angle = 90, hjust = 1),
+      text = txt, 
+      plot.title = bold_txt, 
+      
+      axis.title = txt, 
+      axis.text = txt, 
+      
+      legend.title = bold_txt, 
+      legend.text = txt ) 
+}
+
+
+
+```
 
 ### Join Shift Level Data
 
@@ -7,6 +59,7 @@
 load("~/Documents/CWA/Hockey Data/skater_shift_level_1418.RData")
 load("~/Documents/CWA/Hockey Data/goalie_day_level.RData")
 
+goalie_est_ability <- goalie_day_level %>% select(SA_Goalie_Id, season, Game_Id, gameday_estimated_ability)
 penalty_xG <- 0.17
 
 ### Join & Create target variable
@@ -28,22 +81,19 @@ skater_shift_level <-skater_shift_level_1418 %>%
                xGF_total = 0 + xGF + (PenDraw * penalty_xG),
                xGA_total = 0 + xGA + (PenTake * penalty_xG)) %>% 
       na.omit() %>%
-      rename(Score_State0 = Score_State) %>%
-      group_by(Player, Player_Id, season, Game_Id) %>%
-      mutate(Score_State = ifelse(is.na(lag(Score_State0)),0,lag(Score_State0))) %>%
-      ungroup()
+      ungroup() %>%
+      left_join(goalie_est_ability %>% rename(Team_Goalie_EstAbility = gameday_estimated_ability), by = c("Team_Goalie_Id" = "SA_Goalie_Id","season"="season","Game_Id"="Game_Id")) %>%
+      left_join(goalie_est_ability %>% rename(Opposing_Goalie_EstAbility = gameday_estimated_ability), by = c("Opposing_Goalie_Id" = "SA_Goalie_Id","season"="season","Game_Id"="Game_Id"))
 
 skater_shift_level$Impacts <- relevel(skater_shift_level$Impacts, ref = "NA")
 skater_shift_level$Production <- relevel(skater_shift_level$Production, ref = "NA")
 skater_shift_level$Penalty <- relevel(skater_shift_level$Penalty, ref = "NA")
-
 
 skater_shift_level %>% group_by(Impacts) %>% summarise(Cnt = n()) %>% group_by() %>% mutate(Share = Cnt / sum(Cnt)) %>% arrange(-Cnt)
 
 skater_shift_level %>% group_by(Production,Penalty) %>% summarise(Cnt = n()) %>% group_by() %>% mutate(Share = Cnt / sum(Cnt)) %>% arrange(-Cnt)
 
 skater_shift_level %>% group_by(Points1, Points2, Production) %>% summarise(cnt = n())
-
 
 skater_shift_level %>%
     select(xGF_total, xGA_total) %>%
@@ -66,7 +116,6 @@ quality_features <- skater_shift_level %>%
     ggthemes::scale_fill_gdocs() +
     labs(title="Player-Shift Level Teammate and Competition Quality",x="Estimated Ability",fill="Metric")
 
-
 ggsave(filename="/Users/colander1/Downloads/quality_features.png", plot=quality_features,  width=16, height=12)
 
 ```
@@ -79,15 +128,14 @@ load("~/Documents/CWA/Hockey Data/player_level_quality.RData")
 
 skater_shift_level_clean <- skater_shift_level %>% 
       left_join(unique(player_level_quality[c("shooterID","Pos")]), by = c("Player_Id"="shooterID")) %>%
-      select(xGF_total, xGA_total, Player_Venue,Score_State,Off_FO_Shift, Def_FO_Shift,OTF_Shift,Strength_State, Mean_Teammates , Mean_Competition, #Max_Teammates, Max_Competition,Min_Teammates, Min_Competition, 
-             Pos) %>%
+      select(xGF_total, xGA_total, Player_Venue,Score_State,Off_FO_Shift, Def_FO_Shift,OTF_Shift,Strength_State, Mean_Teammates_F, Mean_Competition_F, Mean_Teammates_D, Mean_Competition_D, Team_Goalie_EstAbility, Opposing_Goalie_EstAbility, Pos) %>%
       mutate(Player_Venue = as.factor(Player_Venue),
              Off_FO_Shift = as.factor(Off_FO_Shift),
              Def_FO_Shift = as.factor(Def_FO_Shift),
              OTF_Shift = as.factor(OTF_Shift),
              Pos = as.factor(Pos))
 
-model_features <- skater_shift_level_clean %>% select(-starts_with("xG"))
+model_features <- skater_shift_level_clean %>% select(-starts_with("xG"), -ends_with("EstAbility"))
 
 ## Scale and Center
 #preProcValues <- preProcess(model_features, method = c("center", "scale"))
@@ -100,8 +148,15 @@ input_data <- data.frame(predict(dmy, newdata = model_features))
 feature_list <- colnames(input_data)
 
 model_data <- input_data %>%
-      mutate(xGF_total = skater_shift_level_clean$xGF_total,
-             xGA_total = skater_shift_level_clean$xGA_total)
+      mutate(xGF_total = skater_shift_level$xGF_total,
+             xGA_total = skater_shift_level$xGA_total,
+             Team_Goalie_EstAbility = ifelse(is.na(skater_shift_level$Team_Goalie_EstAbility),0,skater_shift_level$Team_Goalie_EstAbility),
+          Opposing_Goalie_EstAbility = ifelse(is.na(skater_shift_level$Opposing_Goalie_EstAbility),0,skater_shift_level$Opposing_Goalie_EstAbility),
+             tGF = (ifelse(skater_shift_level$GF > 0,1,0)),
+             txGF = skater_shift_level$xGF,
+             tPD = (ifelse(skater_shift_level$PenDraw > 0,1,0)),
+             tPT = (ifelse(skater_shift_level$PenTake > 0,1,0))
+)
 
 ```
 
@@ -140,74 +195,78 @@ txGA <- skater_shift_level$xGA_total
 
 ```
 
-### Final Production Model
+### xGBoostXFinal Production Model
 
 ```{r}
 set.seed(7)
-# configure multicore
-library(doMC)
-registerDoMC(cores=4)
 
-logistic_model <- function(target_vec, gf_vec = FALSE, nm) {
+logistic_xgboost_model <- function(target, nm, model_features = feature_list) {
     
-    ## Cross-validation
-    train_control <- trainControl(method="cv", number=5,  allowParallel = TRUE)
-                      
-    ## Lambda gird   
-    grid <- expand.grid(lambda=seq(0,1,by=0.2), cp = c("aic", "bic"))
+      model_data2 <- model_data[model_features] %>%
+                      cbind(target)
+      
+      index <- createDataPartition(model_data2$target, p=0.75, list=FALSE)
+      train_data <- xgb.DMatrix(as.matrix(model_data2[model_features]),label=model_data2[,c("target")] )
+      test_data <- xgb.DMatrix(as.matrix(model_data2[-index,model_features]),label=model_data2[-index,c("target")] )
+      model_dbg <- xgb.DMatrix(as.matrix(model_data2[,model_features]),label=model_data2[,c("target")] )
+      
+      bst_model <- xgb.train( params = list(objective = "binary:logistic",
+                  eta = 0.05,   # step size / shrinkage
+                  max_depth = 6,  # Max depth of each tree
+                  gamma = 0,    # Minimum loss function for leaf to be split
+                  min_child_weight = 20,    # Min number of cases in leaf
+                  subsample = 0.3,    # Sample of cases for each tree
+                  colsample_bytree = 0.7,  # Ratio of columns to sample
+                  missing = NA,
+                  stratified = TRUE,
+                  nthread = 2,   # maximum number of cores/ threads to use for training
+                  early_stopping_rounds = 5,  # set to value of consecutive worse performance to terminate
+                  nfold = 5,
+                  base_score = mean(target),
+                  prediction = TRUE,
+                  print_every_n = 25,
+                  metrics = "logloss"),
+                  train_data, nrounds = 100, list(eval = test_data, train = train_data))
+      
+      importance_matrix <- xgb.importance(feature_names = model_features, model = bst_model)
+      
+      importance_plot = xgb.plot.importance(importance_matrix)
+      
+      ## Output predicted values
+      predicted <- predict(bst_model, model_dbg,type="prob")
+  
+      ## Print results
+      niave_ll <- Metrics::logLoss(target,mean(target))
+      model_ll <- Metrics::logLoss(target,predicted)
+      lift <- round((niave_ll - model_ll) / niave_ll,4)
+      
+      print(paste0(nm,"  Model, Baseline Logloss: ",round(niave_ll,4),"  Model Logloss: ",round(model_ll,4),"Lift: ",lift))
     
-    model_data2 <- data.frame(cbind(target = target_vec,
-                                                           tGF,
-                                                           model_data[feature_list])) %>% 
-                    select(ifelse(gf_vec == FALSE,-starts_with("tGF"),starts_with("null"))) %>%
-                    head(10000) %>%
-                    as.data.frame()
+      ## Save Model
+      saveRDS(model, paste0("/Users/colander1/Documents/CWA/Hockey Data/WARData/",nm,"_bstmodel.rds"))
     
-    print(head(model_data2))
-    
-    ## Model, penaltized logistic regression
-    model <- caret::train(target ~ .,
-                                   data = model_data2,
-                                   trControl=train_control, 
-                                   tuneGrid=grid,
-                                    method="plr"
-                               )  #method="glm", family="binomial") metric="LogLoss","#metric="ROC"#,
-						                       
-    ## Output variable imporance
-    variable_importance <- varImp(model)
-                
-    ## Output predicted values
-    predicted <- predict(model, model_data2,type="prob")$`1`
-
-    ## Print results
-    niave_ll <- Metrics::logLoss(as.numeric(target_vec)-1,mean(as.numeric(target_vec)-1))
-    model_ll <- Metrics::logLoss(as.numeric(target_vec)-1,predicted)
-    lift <- round((niave_ll - model_ll) / niave_ll,4)
-    
-    print(paste0(nm," Model, Baseline Logloss: ",round(niave_ll,4),"Model Logloss: ",round(model_ll,4),"Lift: ",lift))
-    
-    ## Save Model
-    saveRDS(model, paste0("/Users/colander1/Documents/CWA/Hockey Data/WARData/",nm,"_model.rds"))
-    
-    return(list(model,variable_importance, predicted))
+      return(list(model,variable_importance, predicted))
     
 }
 
-iG_output <- logistic_model(iG, TRUE,"iG") # 0.04143627
+print(feature_list)
 
+tGF_output <- logistic_xgboost_model(tGF, "teamGF", c(feature_list,"Opposing_Goalie_EstAbility"))
+tGA_output <- logistic_xgboost_model(tGA, "teamGA", c(feature_list,"Team_Goalie_EstAbility"))
+tPD_output <- logistic_xgboost_model(tPD, "teamPD")
+tPT_output <- logistic_xgboost_model(tPT, "teamPT")
 
-tGF_output <- logistic_model(tGF, FALSE,"tGF")
-#tGA_output <- logistic_model(tGA, FALSE,"tGF")
-tPD_output <- logistic_model(tPD, FALSE,"tPD")
-tPT_output <- logistic_model(tPT, FALSE,"tPT")
+iG_output <- logistic_xgboost_model(iG, "iG", c(feature_list,"tGF","Opposing_Goalie_EstAbility")) # 0.04174799
+iA1_output <- logistic_xgboost_model(iA1, "iA1", c(feature_list,"tGF","Opposing_Goalie_EstAbility")) # 0.04174799
+iA2_output <- logistic_xgboost_model(iA2, "iA2", c(feature_list,"tGF","Opposing_Goalie_EstAbility")) # 0.0426679
 
-iA1_output <- logistic_model(iA1, TRUE,"iA1") # 0.04174799
-iA2_output <- logistic_model(iA2, TRUE,"iA2") # 0.0426679
-
-iPD <- logistic_model(iPD, FALSE,"iPD")
-iPT <- logistic_model(iPT, FALSE,"iPT")
+iPD <- logistic_xgboost_model(iPD, "iPD", c(feature_list, "tPD"))
+iPT <- logistic_xgboost_model(iPT, "iPT", c(feature_list, "tPT"))
 
 ```
+
+
+
 ## Goal Impact Model
 
 ```{r}

@@ -174,7 +174,8 @@ goalie_day_level <- goalie_shot_level_prep %>%
                                       ifelse(season != lag(season),
                                         season_predicted_lift,     
 
-                                            lag(cum_regressed_lift / 100)))))
+                                            lag(cum_regressed_lift / 100))))) %>%
+      ungroup()
 
 save(goalie_day_level, file = "~/Documents/CWA/Hockey Data/goalie_day_level.RData")
 
