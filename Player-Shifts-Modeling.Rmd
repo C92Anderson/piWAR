@@ -178,17 +178,17 @@ model_data <- input_data %>%
 
 ```{r}
 
-tGF <- factor(ifelse(skater_shift_level$GF > 0,1,0))
-tGA <- factor(ifelse(skater_shift_level$GA > 0,1,0))
-tPD <- factor(ifelse(skater_shift_level$PenDraw > 0,1,0))
-tPT <- factor(ifelse(skater_shift_level$PenTake > 0,1,0))
+tGF <- (ifelse(skater_shift_level$GF > 0,1,0))
+tGA <- (ifelse(skater_shift_level$GA > 0,1,0))
+tPD <- (ifelse(skater_shift_level$PenDraw > 0,1,0))
+tPT <- (ifelse(skater_shift_level$PenTake > 0,1,0))
 
-iG <- factor(ifelse(skater_shift_level$iG > 0,1,0))
-iA1 <- factor(ifelse(skater_shift_level$iP1 - skater_shift_level$iG > 0,1,0))
-iA2 <- factor(ifelse(skater_shift_level$iP - skater_shift_level$iP1 > 0,1,0))
+iG <- (ifelse(skater_shift_level$iG > 0,1,0))
+iA1 <- (ifelse(skater_shift_level$iP1 - skater_shift_level$iG > 0,1,0))
+iA2 <- (ifelse(skater_shift_level$iP - skater_shift_level$iP1 > 0,1,0))
 
-iPD <- factor(ifelse(skater_shift_level$iPenDraw > 0,1,0))
-iPT <- factor(ifelse(skater_shift_level$iPenTake > 0,1,0))
+iPD <- (ifelse(skater_shift_level$iPenDraw > 0,1,0))
+iPT <- (ifelse(skater_shift_level$iPenTake > 0,1,0))
 
 txGF <- skater_shift_level$xGF_total
 txGA <- skater_shift_level$xGA_total
@@ -224,13 +224,13 @@ logistic_xgboost_model <- function(target, nm, model_features = feature_list) {
                   nfold = 5,
                   base_score = mean(target),
                   prediction = TRUE,
+                  verbose = 1, 
                   print_every_n = 25,
                   metrics = "logloss"),
                   train_data, nrounds = 100, list(eval = test_data, train = train_data))
       
       importance_matrix <- xgb.importance(feature_names = model_features, model = bst_model)
-      
-      importance_plot = xgb.plot.importance(importance_matrix)
+      #importance_plot = xgb.plot.importance(importance_matrix)
       
       ## Output predicted values
       predicted <- predict(bst_model, model_dbg,type="prob")
@@ -243,29 +243,57 @@ logistic_xgboost_model <- function(target, nm, model_features = feature_list) {
       print(paste0(nm,"  Model, Baseline Logloss: ",round(niave_ll,4),"  Model Logloss: ",round(model_ll,4),"Lift: ",lift))
     
       ## Save Model
-      saveRDS(model, paste0("/Users/colander1/Documents/CWA/Hockey Data/WARData/",nm,"_bstmodel.rds"))
+      saveRDS(bst_model, paste0("/Users/colander1/Documents/CWA/Hockey Data/WARData/",nm,"_bstmodel.rds"))
     
-      return(list(model,variable_importance, predicted))
+      return(list(bst_model,importance_matrix, predicted))
     
 }
 
-print(feature_list)
 
-tGF_output <- logistic_xgboost_model(tGF, "teamGF", c(feature_list,"Opposing_Goalie_EstAbility"))
-tGA_output <- logistic_xgboost_model(tGA, "teamGA", c(feature_list,"Team_Goalie_EstAbility"))
-tPD_output <- logistic_xgboost_model(tPD, "teamPD")
-tPT_output <- logistic_xgboost_model(tPT, "teamPT")
+## Binary Team Impacts
+teamGF_output <- logistic_xgboost_model(tGF, "teamGF", c(feature_list,"Opposing_Goalie_EstAbility"))
+teamGA_output <- logistic_xgboost_model(tGA, "teamGA", c(feature_list,"Team_Goalie_EstAbility"))
+teamPD_output <- logistic_xgboost_model(tPD, "teamPD")
+teamPT_output <- logistic_xgboost_model(tPT, "teamPT")
 
-iG_output <- logistic_xgboost_model(iG, "iG", c(feature_list,"tGF","Opposing_Goalie_EstAbility")) # 0.04174799
-iA1_output <- logistic_xgboost_model(iA1, "iA1", c(feature_list,"tGF","Opposing_Goalie_EstAbility")) # 0.04174799
-iA2_output <- logistic_xgboost_model(iA2, "iA2", c(feature_list,"tGF","Opposing_Goalie_EstAbility")) # 0.0426679
+## Production as function of actual
+iG_fg_output <- logistic_xgboost_model(iG, "iG", c(feature_list,"tGF","Opposing_Goalie_EstAbility")) # 0.04174799
+iA1_fg_output <- logistic_xgboost_model(iA1, "iA1", c(feature_list,"tGF","Opposing_Goalie_EstAbility")) # 0.04174799
+iA2_fg_output <- logistic_xgboost_model(iA2, "iA2", c(feature_list,"tGF","Opposing_Goalie_EstAbility")) # 0.0426679
+
+## Production as function of expected
+iG_fxg_output <- logistic_xgboost_model(iG, "iG", c(feature_list,"txGF","Opposing_Goalie_EstAbility")) # 0.04174799
+iA1_fxg_output <- logistic_xgboost_model(iA1, "iA1", c(feature_list,"txGF","Opposing_Goalie_EstAbility")) # 0.04174799
+iA2_fxg_output <- logistic_xgboost_model(iA2, "iA2", c(feature_list,"txGF","Opposing_Goalie_EstAbility")) # 0.0426679
 
 iPD <- logistic_xgboost_model(iPD, "iPD", c(feature_list, "tPD"))
 iPT <- logistic_xgboost_model(iPT, "iPT", c(feature_list, "tPT"))
 
+
+
 ```
 
+## Print Model Results
 
+```{r}
+
+
+```
+
+## Explore xGF/xGA Distributions
+
+```{r}
+library(fitdistrplus)
+fitdistrplus::plotdist(txGF, histo = TRUE, demp = TRUE)
+
+fw <- fitdist(txGF, "weibull", method = "mle")
+fg <- fitdist(txGF, "gamma")
+fln <- fitdist(txGF, "lnorm")
+par(mfrow = c(2, 2))
+plot.legend <- c("Weibull", "lognormal", "gamma")
+denscomp(list(fw, fln, fg), legendtext = plot.legend)
+
+```
 
 ## Goal Impact Model
 

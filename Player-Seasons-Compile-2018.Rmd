@@ -1,0 +1,526 @@
+
+## System Prep
+## Load current elo ratings
+
+```{r echo=FALSE}
+library(ggplot2);library(dplyr); library(DataCombine); library(xgboost)
+library(glmnet);library(caret); library(RMySQL); library(readr); library(reshape2); 
+library(data.table); library(reshape2)
+
+
+conn <- dbConnect(MySQL(), user='ca_elo_games', password='cprice31!',
+                  host='mysql.crowdscoutsports.com', db='nhl_all')
+on.exit(dbDisconnect(conn))
+
+## Get prior player level predictions
+crowdscout_data_predictions <- dbGetQuery(conn, "SELECT *
+                         FROM crowdscout_data_predictions")
+
+#save(crowdscout_data_predictions, file="~/Documents/CWA/Hockey Data/crowdscout_data_predictions.RData")
+#save(player_elo, file="~/Documents/CWA/Hockey Data/player_elo.RData")
+
+detach("package:RMySQL", unload=TRUE)
+```
+
+## Create raw PBP
+
+```{r}
+
+read_raw_pbp <- function(file_year) {
+  
+  raw_pbp <- read.csv(paste0("~/Documents/CWA/HockeyScrape/nhl_pbp",file_year,".csv")) %>%
+          mutate(season = file_year) %>%
+          select(-ends_with("X"), -starts_with("Unnam"))
+  
+  return(raw_pbp)
+
+}
+
+read_raw_shift <- function(file_year) {
+  
+  raw_shift <- read.csv(paste0("~/Documents/CWA/HockeyScrape/nhl_shifts",file_year,".csv")) %>%
+          mutate(season = file_year) %>%
+          select(-ends_with("X"), -ends_with("Date"), -starts_with("Unnam")) %>%
+          mutate(Game_Id = ifelse(nchar(Game_Id) > 6, as.integer(substr(Game_Id,6,11)), as.integer(Game_Id)))
+  
+  return(raw_shift)
+
+}
+
+read_xG_scored <- function(file_year) {
+  
+  xG_data <- read.csv(paste0("~/Documents/CWA/HockeyScrape/scored_data",file_year,".csv")) %>%
+          select(-ends_with("X"), -ends_with("Date")) %>%
+          mutate(Game_Id = ifelse(nchar(Game_Id) > 6, as.integer(substr(Game_Id,6,11)), as.integer(Game_Id)),
+                 xG = xG_raw,
+                 xG_team = ifelse(is_Rebound == 0, xG_raw,
+                          ifelse(is_Rebound == 1 & lag(is_Rebound) == 0, xG_raw * (1-lag(xG_raw)),
+                                 ifelse(is_Rebound == 1 & lag(is_Rebound) == 1 & lag(is_Rebound,2) == 0,
+                                        xG_raw * (1-lag(xG_raw)) * (1-lag(xG_raw,2)),
+                                        ifelse(is_Rebound == 1 & lag(is_Rebound) == 1 & lag(is_Rebound,2) == 1 & lag(is_Rebound,3) == 0,
+                                               xG_raw * (1-lag(xG_raw)) * (1-lag(xG_raw,2)) * (1-lag(xG_raw,3)),
+                                               ifelse(is_Rebound == 1 & lag(is_Rebound) == 1 & lag(is_Rebound,2) == 1 & lag(is_Rebound,3) == 1 & lag(is_Rebound,4) == 0,
+                                                      xG_raw * (1-lag(xG_raw)) * (1-lag(xG_raw,2)) * (1-lag(xG_raw,3)) * (1-lag(xG_raw,4)),
+                                                      xG_raw * (1-lag(xG_raw)) * (1-lag(xG_raw,2)) * (1-lag(xG_raw,3)) * (1-lag(xG_raw,4))))))))
+
+  return(xG_data)
+
+}
+
+
+
+seasons <- c(seq(20142015,20172018,by=10001))
+
+pbp_all_raw <- do.call(dplyr::bind_rows,lapply(FUN=read_raw_pbp,seasons))
+
+shift_all_raw <- do.call(dplyr::bind_rows,lapply(FUN=read_raw_shift,seasons))
+
+season_blocks <- c('2015_2016','2017_2018')
+
+scored_data <- do.call(dplyr::bind_rows,lapply(FUN=read_xG_scored,season_blocks))
+
+
+```
+
+## Load Scored Data and Create Master PBP
+
+```{r}
+
+### Join xG to all PBP data
+player_data <- pbp_all_raw %>% 
+            select(-c(xC, yC, Description)) %>% ## drop some duplicates
+            unique() %>%
+  mutate(Event = ifelse(Event %in% c("GIVE","TAKE"),"TURN",as.character(Event)),
+         Type = ifelse(Type %in% c("DEFLECTED","TIP-IN"),"DEFLECTED",
+                       ifelse(Type %in% c("WRIST SHOT","SNAP SHOT","WRAP-AROUND"),"WRIST SHOT",as.character(Type)))) %>%
+         
+  left_join(unique(scored_data[c("season", "Game_Id", "Period","Seconds_Elapsed", "Event","Type", "xG", "xG_team")]), by = c("season","Game_Id","Period","Seconds_Elapsed","Event","Type")) %>%
+  mutate(season = as.factor(season),
+         Goal = ifelse(Event=="GOAL",1,0),
+         xG = ifelse(is.na(xG),0,as.numeric(xG)),
+         xG_team = ifelse(is.na(xG_team),0,as.numeric(xG_team)),
+         ## Duration
+         Same_Period = ifelse(Game_Id == lag(Game_Id) & Period == lag(Period), 1, 0),                    
+         Duration = ifelse(Same_Period == 1, Seconds_Elapsed - lag(Seconds_Elapsed), 0) ) %>%
+  # Remove Regular Season Shootouts
+  filter(!(Period== "5" & substr(Game_Id,1,1) == "2")) %>%
+  #filter(!Event %in% c("PGSTR","PGEND","ANTHEM")) %>%
+  mutate(event_index = row_number())
+  
+### Standardize Player Names
+player_names <- player_data  %>%
+   select(starts_with("homePlayer"), starts_with("awayPlayer"), Away_Goalie,Away_Goalie_Id,Home_Goalie,Home_Goalie_Id, p1_name, p2_name, p3_name,p1_ID, p2_ID, p3_ID, season) 
+
+```
+
+## Find Unique Skaters
+
+```{r}
+
+goalie_id_list <- as.data.frame(rbind(distinct(player_names[c(25:26,35)]) %>% rename(Goalie = Away_Goalie, goalieID = Away_Goalie_Id),
+                           distinct(player_names[c(27:28,35)]) %>% rename(Goalie = Home_Goalie, goalieID = Home_Goalie_Id))) %>% 
+              na.omit() %>%
+              group_by(goalieID, Goalie) %>%
+              mutate(cnt = n()) %>%
+              arrange(-cnt) %>%
+              group_by(goalieID) %>%
+              mutate(Goalie = ifelse(cnt == max(cnt),as.character(Goalie),NA)) %>%
+              tidyr::fill(Goalie) %>%
+              distinct() %>%
+              select(-c(cnt))
+
+
+skater_id_list <- as.data.frame(rbind(
+       distinct(player_names[c(1:2,35)]) %>% rename(Player = homePlayer1, shooterID = homePlayer1_id) %>% mutate(Pos2 = 1),
+       distinct(player_names[c(3:4,35)]) %>% rename(Player = homePlayer2, shooterID = homePlayer2_id) %>% mutate(Pos2 = 2),
+       distinct(player_names[c(5:6,35)]) %>% rename(Player = homePlayer3, shooterID = homePlayer3_id) %>% mutate(Pos2 = 3),
+       distinct(player_names[c(7:8,35)]) %>% rename(Player = homePlayer4, shooterID = homePlayer4_id) %>% mutate(Pos2 = 4),
+       distinct(player_names[c(9:10,35)]) %>% rename(Player = homePlayer5, shooterID = homePlayer5_id) %>% mutate(Pos2 = 5),
+       distinct(player_names[c(11:12,35)]) %>% rename(Player = homePlayer6, shooterID = homePlayer6_id) %>% mutate(Pos2 = 6),
+       distinct(player_names[c(13:14,35)]) %>% rename(Player = awayPlayer1, shooterID = awayPlayer1_id) %>% mutate(Pos2 = 1),
+       distinct(player_names[c(15:16,35)]) %>% rename(Player = awayPlayer2, shooterID = awayPlayer2_id) %>% mutate(Pos2 = 2),
+       distinct(player_names[c(17:18,35)]) %>% rename(Player = awayPlayer3, shooterID = awayPlayer3_id) %>% mutate(Pos2 = 3),
+       distinct(player_names[c(19:20,35)]) %>% rename(Player = awayPlayer4, shooterID = awayPlayer4_id) %>% mutate(Pos2 = 4),
+       distinct(player_names[c(21:22,35)]) %>% rename(Player = awayPlayer5, shooterID = awayPlayer5_id) %>% mutate(Pos2 = 5),
+       distinct(player_names[c(23:24,35)]) %>% rename(Player = awayPlayer6, shooterID = awayPlayer6_id) %>% mutate(Pos2 = 6)
+                           )) %>% 
+              na.omit() %>%
+              #
+              group_by(shooterID, Player) %>%
+              mutate(cnt = n(),
+                     Pos_Spot = mean(Pos2, na.rm=T)) %>%
+              arrange(-cnt) %>%
+              group_by(shooterID) %>%
+              mutate(Player = ifelse(cnt == max(cnt),as.character(Player),NA)) %>%
+              tidyr::fill(Player) %>%
+              select(-c(cnt, Pos2)) %>%
+              distinct() %>%
+              anti_join(goalie_id_list, by = c("shooterID" = "goalieID"))
+  
+```
+
+## Quality of Teammates/Competition
+
+```{r}
+player_level_quality <- crowdscout_data_predictions[c("shooterID","season","Pos","Predicted.CS")] %>%
+                    mutate(shooterID = as.integer(shooterID)) %>%
+                    right_join(skater_id_list, by = c("shooterID","season")) %>%
+                    arrange(shooterID, as.factor(season)) %>%
+                    group_by(shooterID) %>%
+                    tidyr::fill(Pos, Predicted.CS) %>%
+                    rename(Predicted_CS = Predicted.CS) %>%
+                    mutate(Pos = ifelse(!is.na(Pos),as.character(Pos),
+                                 ifelse(Pos_Spot > 3.5, "D","F")),
+                           Predicted_CS = ifelse(is.na(Predicted_CS),35,Predicted_CS)) %>%
+                    select(-c(Pos_Spot, Player))
+
+save(player_level_quality, file="~/Documents/CWA/Hockey Data/player_level_quality.RData")
+
+
+quality_onice <- as.data.frame(season = as.factor(player_data$season), Game_Id = player_data$Game_Id, player_names, Duration = player_data$Duration) %>%
+  select(-c(Away_Goalie,Home_Goalie, p1_name, p2_name, p3_name)) %>%
+  ## H1
+  left_join(player_level_quality, by = c("homePlayer1_id" = "shooterID", "season" = "season")) %>%
+  rename(homePlayer1_elo = Predicted_CS, homePlayer1_Pos = Pos) %>%
+  ## H2
+  left_join(player_level_quality, by = c("homePlayer2_id" = "shooterID", "season" = "season")) %>%
+  rename(homePlayer2_elo = Predicted_CS, homePlayer2_Pos = Pos) %>%
+  ## H3
+  left_join(player_level_quality, by = c("homePlayer3_id" = "shooterID", "season" = "season")) %>%
+  rename(homePlayer3_elo = Predicted_CS, homePlayer3_Pos = Pos) %>%
+  ## H4
+  left_join(player_level_quality, by = c("homePlayer4_id" = "shooterID", "season" = "season")) %>%
+  rename(homePlayer4_elo = Predicted_CS, homePlayer4_Pos = Pos) %>%
+  ## H5
+  left_join(player_level_quality, by = c("homePlayer5_id" = "shooterID", "season" = "season")) %>%
+  rename(homePlayer5_elo = Predicted_CS, homePlayer5_Pos = Pos) %>%
+  ## H6
+  left_join(player_level_quality, by = c("homePlayer6_id" = "shooterID", "season" = "season")) %>%
+  rename(homePlayer6_elo = Predicted_CS, homePlayer6_Pos = Pos) %>%
+  ## A1
+  left_join(player_level_quality, by = c("awayPlayer1_id" = "shooterID", "season" = "season")) %>%
+  rename(awayPlayer1_elo = Predicted_CS, awayPlayer1_Pos = Pos) %>%
+  ## A2
+  left_join(player_level_quality, by = c("awayPlayer2_id" = "shooterID", "season" = "season")) %>%
+  rename(awayPlayer2_elo = Predicted_CS, awayPlayer2_Pos = Pos) %>%
+  ## A3
+  left_join(player_level_quality, by = c("awayPlayer3_id" = "shooterID", "season" = "season")) %>%
+  rename(awayPlayer3_elo = Predicted_CS, awayPlayer3_Pos = Pos) %>%
+  ## A4
+  left_join(player_level_quality, by = c("awayPlayer4_id" = "shooterID", "season" = "season")) %>%
+  rename(awayPlayer4_elo = Predicted_CS, awayPlayer4_Pos = Pos) %>%
+  ## A5
+  left_join(player_level_quality, by = c("awayPlayer5_id" = "shooterID", "season" = "season")) %>%
+  rename(awayPlayer5_elo = Predicted_CS, awayPlayer5_Pos = Pos) %>%
+  ## A6
+  left_join(player_level_quality, by = c("awayPlayer6_id" = "shooterID", "season" = "season")) %>%
+  rename(awayPlayer6_elo = Predicted_CS, awayPlayer6_Pos = Pos) 
+
+quality_onice_elos <- quality_onice %>%
+          select(ends_with("elo"),ends_with("Pos"))
+
+```
+
+## Clean Data with shift by shift elos  
+
+```{r}
+player_data_clean <- player_data %>% 
+      select(event_index, Game_Id, Date, Period, Ev_Team, Home_Team, Away_Team, Home_Zone, Event, Seconds_Elapsed, xG_team, xG, Home_Team, Away_Team, Home_Score, Away_Score, Home_Players, Away_Players, Home_Coach, Away_Coach) %>%
+      cbind(player_names, quality_onice_elos) %>%
+      as.data.frame() %>%
+      ungroup() %>%
+      mutate(season = as.integer(as.character(season)),
+            Home_Game_State0 = paste0(Home_Players,"v",Away_Players)
+            ) %>%
+      ## if back-to-back events, set last event back 0.5 second for merge
+      group_by(season, Game_Id, Period) %>%
+      mutate(Seconds_Clean = ifelse(Seconds_Elapsed == lead(Seconds_Elapsed), Seconds_Elapsed - 0.5,
+                                 ifelse(Seconds_Elapsed == lag(Seconds_Elapsed),Seconds_Elapsed + 0.5, Seconds_Elapsed))) %>%
+      group_by(season, Game_Id) %>%
+      mutate(Home_Game_State = ifelse(Home_Game_State0 %in% c("3v5","3v4","3v6","4v5","4v6","5v6","4v5","6v7"),"SH",
+                               ifelse(Home_Game_State0 %in% c("6v3","6v4","5v3","6v5","5v4","4v3"),"PP",
+                               ifelse(Home_Game_State0 %in% c("5v5","6v6","4v4","3v3"),"EV",
+                               ifelse(Home_Game_State0 %in% c("1v1","0v1","1v0"),"PS",
+                               ifelse(lag(Home_Game_State0,1) %in% c("3v5","3v4","3v6","4v5","4v6","5v6","4v5"),"SH",
+                               ifelse(lag(Home_Game_State0,1) %in% c("6v3","6v4","5v3","6v5","5v4","4v3"),"PP",
+                               ifelse(lag(Home_Game_State0,1) %in% c("5v5","6v6","4v4","3v3"),"EV",
+                                        "EV"))))))))
+
+```
+
+### Player Function
+
+```{r}
+
+skater_season_stats <- function(i,szns = c("20142015","20152016","20162017","20172018")) {
+    
+    player_name <- skater_id_list %>% filter(shooterID == i) %>% ungroup() %>% select(Player) %>% distinct() %>% as.character()
+    
+    print(player_name)
+
+    ### Player On-Ice For Events
+    player_onice <- tryCatch(player_data_clean %>%
+          filter(season %in% szns) %>%
+          filter(awayPlayer1_id %in% c(i) | awayPlayer2_id %in% c(i) | awayPlayer3_id %in% c(i) | awayPlayer4_id %in% c(i) | awayPlayer5_id %in% c(i) | awayPlayer6_id %in% c(i) | homePlayer1_id %in% c(i) | homePlayer2_id %in% c(i) | homePlayer3_id %in% c(i) | homePlayer4_id %in% c(i) | homePlayer5_id %in% c(i) | homePlayer6_id %in% c(i) ) %>%
+          mutate(Player = as.factor(player_name),
+                 Player_Id = i))
+
+      ### Player Shift Sums
+      player_shifts_data_raw <- tryCatch(shift_all_raw %>%
+            filter(season %in% szns) %>%
+            filter(Player_Id == i) %>%
+            mutate(shift_bool = 1,
+                   season = as.integer(as.character(season)),
+                   Player = as.factor(player_name)) %>%
+            group_by(season, Player, Player_Id, Game_Id) %>% 
+            mutate(Game_Shift_No = cumsum(shift_bool)) %>%
+            group_by(season, Player, Player_Id) %>% 
+            mutate(Season_Shift_No = cumsum(shift_bool)))
+      
+      player_game_toi <- player_shifts_data_raw %>%
+            group_by(Player, Player_Id, season, Game_Id) %>%
+            summarise(Gm_TOI = sum(Duration)/60)
+
+        ### Leaves out shifts with no events
+        player_shifts_data <- sqldf::sqldf("
+                      SELECT Team,Start,End,Duration,shift_bool,Game_Shift_No,Season_Shift_No, b.*
+                      FROM player_shifts_data_raw as a
+                      LEFT JOIN player_onice as b
+                      ON a.Player = b.Player
+                      AND a.Player_Id = b.Player_Id
+                      AND a.season = b.season
+                      AND a.Game_Id = b.Game_Id
+                      AND a.Period = b.Period
+                      AND a.Start <= b.Seconds_Clean
+                      AND b.Seconds_Clean <= a.End
+                  ") %>%
+              filter(!is.na(event_index)) %>%
+              group_by(Player, Player_Id, season, Game_Id, Period, Season_Shift_No, Game_Shift_No) %>%
+              mutate(Team = as.character(Team),
+                     Player_Venue =  ifelse(Team == Home_Team,"Home","Away"),
+                     Ev_Team = as.character(Ev_Team),
+                     Player_State = ifelse(Team == Home_Team | Home_Game_State == "EV",Home_Game_State,
+                                       ifelse(Home_Game_State == "SH" & Team != Home_Team,"PP",
+                                       ifelse(Home_Game_State == "PP" & Team != Home_Team,"SH",
+                                              "EV"))),
+                     TOI = ifelse(is.na(lag(Seconds_Elapsed)) & is.na(lead(Seconds_Elapsed)), End - Start, 
+                           ifelse(is.na(lag(Seconds_Elapsed)), Seconds_Elapsed - Start, 
+                           ifelse(is.na(lead(Seconds_Elapsed)), (End - Seconds_Elapsed) + (Seconds_Elapsed - lag(Seconds_Elapsed)), 
+                                  Seconds_Elapsed - lag(Seconds_Elapsed)))),
+                     SF = ifelse((Team == Ev_Team) & (Event %in% c("SHOT","MISS","BLOCK","GOAL")), 1, 0),
+                     SA = ifelse((Team != Ev_Team) & (Event %in% c("SHOT","MISS","BLOCK","GOAL")), 1, 0),
+                     GF = ifelse((Team == Ev_Team) & (Event %in% c("GOAL")), 1, 0),
+                     GA = ifelse((Team != Ev_Team) & (Event %in% c("GOAL")), 1, 0),
+                     xGF = ifelse((Team == Ev_Team) & (Event %in% c("SHOT","MISS","BLOCK","GOAL")), xG_team, 0),
+                     xGA = ifelse((Team != Ev_Team) & (Event %in% c("SHOT","MISS","BLOCK","GOAL")), xG_team, 0),
+                     
+                     G = ifelse(Event == "GOAL" & p1_ID %in% c(i), 1, 0),
+                     A1 = ifelse(Event == "GOAL" & p2_ID %in% c(i), 1, 0),
+                     A2 = ifelse(Event == "GOAL" & p3_ID %in% c(i), 1, 0),
+                     ixG = ifelse(p1_ID %in% c(i), xG, 0),
+                     iSF = ifelse(p1_ID %in% c(i), SF, 0),
+   
+                     PenDraw = ifelse((Team != Ev_Team) & (Event %in% c("PENL")), 1, 0),
+                     PenTake = ifelse((Team == Ev_Team) & (Event %in% c("PENL")), 1, 0),
+                     
+                     iPenDraw = ifelse((Team != Ev_Team) & Event %in% c("PENL") & (p1_ID %in% c(i) | p2_ID %in% c(i)), 1, 0),
+                     iPenTake = ifelse((Team == Ev_Team) & Event %in% c("PENL") & (p1_ID %in% c(i) | p2_ID %in% c(i)), 1, 0),
+                    
+                     ZoneStart = ifelse(Seconds_Elapsed != Start,"OTF",
+                                 ifelse(Home_Zone == "Neu","Neu",
+                                 ifelse(Team == Home_Team, as.character(Home_Zone),
+                                 ifelse(Home_Zone == "Def","Off","Def")))),
+                     Team_Players = ifelse(Team == Home_Team, Home_Players, Away_Players),
+                     Opp_Players = ifelse(Team == Home_Team, Away_Players , Home_Players),
+                     Team_Score = ifelse(Team == Home_Team, Home_Score, Away_Score),
+                     Opp_Score = ifelse(Team == Home_Team, Away_Score, Home_Score),
+                     Strength_State = paste0(Team_Players,"v",Opp_Players),
+                     Score_State = ifelse(Team_Score == Opp_Score,"Tied",
+                                   ifelse(abs(Team_Score - Opp_Score) < 4,as.character(Team_Score - Opp_Score),
+                                   ifelse(Team_Score - Opp_Score > 3,"Up3+",
+                                                "Down3+"))),
+                  
+                  shift_event_index = cumsum(shift_bool),
+                 FO_Shift = max(ifelse(Start == Seconds_Elapsed & Event == "FAC",1,0)),
+                
+                 #OTF_Shift = ifelse((Seconds_Elapsed - lag(Seconds_Elapsed)) != TOI & FO_Shift != 1, 1, 0),
+                 OTF_Shift =  max(ifelse(Start != Seconds_Elapsed & shift_event_index == 1, 1, 0)),
+    
+                 Off_FO_Shift = max(ifelse(FO_Shift == 1 & shift_event_index == 1 & ((Player_Venue == "Home" & Home_Zone == "Off") | (Player_Venue == "Away" & Home_Zone == "Def")),1,0)),
+                 Def_FO_Shift = max(ifelse(FO_Shift == 1 & shift_event_index == 1 & ((Player_Venue == "Home" & Home_Zone == "Def") | (Player_Venue == "Away" & Home_Zone == "Off")),1,0)),
+                 Neu_FO_Shift = max(ifelse(FO_Shift == 1 & shift_event_index == 1 & Home_Zone == "Neu",1,0))) %>%  
+          rowwise() %>%
+          mutate(home_mean_F = sum(((homePlayer1_Pos == "F") * homePlayer1_elo), 
+                                      ((homePlayer2_Pos == "F") * homePlayer2_elo),
+                                      ((homePlayer3_Pos == "F") * homePlayer3_elo),
+                                      ((homePlayer4_Pos == "F") * homePlayer4_elo),
+                                      ((homePlayer5_Pos == "F") * homePlayer5_elo),
+                                      ((homePlayer6_Pos == "F") * homePlayer6_elo), na.rm=T) / 
+                              sum(homePlayer1_Pos == "F", 
+                                  homePlayer2_Pos == "F", 
+                                  homePlayer3_Pos == "F", 
+                                  homePlayer4_Pos == "F", 
+                                  homePlayer5_Pos == "F", 
+                                  homePlayer6_Pos == "F", na.rm=T),
+                 
+                 home_mean_D = sum(((homePlayer1_Pos == "D") * homePlayer1_elo), 
+                                      ((homePlayer2_Pos == "D") * homePlayer2_elo),
+                                      ((homePlayer3_Pos == "D") * homePlayer3_elo),
+                                      ((homePlayer4_Pos == "D") * homePlayer4_elo),
+                                      ((homePlayer5_Pos == "D") * homePlayer5_elo),
+                                      ((homePlayer6_Pos == "D") * homePlayer6_elo), na.rm=T) / 
+                              sum(homePlayer1_Pos == "D", 
+                                  homePlayer2_Pos == "D", 
+                                  homePlayer3_Pos == "D", 
+                                  homePlayer4_Pos == "D", 
+                                  homePlayer5_Pos == "D", 
+                                  homePlayer6_Pos == "D", na.rm=T),
+                 
+                 away_mean_F = sum(((awayPlayer1_Pos == "F") * awayPlayer1_elo), 
+                                      ((awayPlayer2_Pos == "F") * awayPlayer2_elo),
+                                      ((awayPlayer3_Pos == "F") * awayPlayer3_elo),
+                                      ((awayPlayer4_Pos == "F") * awayPlayer4_elo),
+                                      ((awayPlayer5_Pos == "F") * awayPlayer5_elo),
+                                      ((awayPlayer6_Pos == "F") * awayPlayer6_elo), na.rm=T) / 
+                              sum(awayPlayer1_Pos == "F", 
+                                  awayPlayer2_Pos == "F", 
+                                  awayPlayer3_Pos == "F", 
+                                  awayPlayer4_Pos == "F", 
+                                  awayPlayer5_Pos == "F", 
+                                  awayPlayer6_Pos == "F", na.rm=T),
+                                  
+                 away_mean_D = sum(((awayPlayer1_Pos == "D") * awayPlayer1_elo), 
+                                      ((awayPlayer2_Pos == "D") * awayPlayer2_elo),
+                                      ((awayPlayer3_Pos == "D") * awayPlayer3_elo),
+                                      ((awayPlayer4_Pos == "D") * awayPlayer4_elo),
+                                      ((awayPlayer5_Pos == "D") * awayPlayer5_elo),
+                                      ((awayPlayer6_Pos == "D") * awayPlayer6_elo), na.rm=T) / 
+                              sum(awayPlayer1_Pos == "D", 
+                                  awayPlayer2_Pos == "D", 
+                                  awayPlayer3_Pos == "D", 
+                                  awayPlayer4_Pos == "D", 
+                                  awayPlayer5_Pos == "D", 
+                                  awayPlayer6_Pos == "D", na.rm=T),
+                 
+                 Mean_Teammates_F = ifelse(Team == Home_Team, home_mean_F, away_mean_F),
+                 Mean_Teammates_D = ifelse(Team == Home_Team, home_mean_D, away_mean_D),
+                 
+                 Mean_Competition_F = ifelse(Team != Home_Team, home_mean_F, away_mean_F),
+                 Mean_Competition_D = ifelse(Team != Home_Team, home_mean_D, away_mean_D),
+
+                 Mean_Teammates_F = ifelse(Mean_Teammates_F < 101 & Mean_Teammates_F >= 0, Mean_Teammates_F, NA),
+                 Mean_Teammates_D = ifelse(Mean_Teammates_D < 101 & Mean_Teammates_D >= 0, Mean_Teammates_D, NA),
+                 
+                 Mean_Competition_F = ifelse(Mean_Competition_F < 101 & Mean_Competition_F >= 0, Mean_Competition_F, NA),
+                 Mean_Competition_D = ifelse(Mean_Competition_D < 101 & Mean_Competition_D >= 0, Mean_Competition_D, NA)
+
+                 ) 
+        
+
+      season_bystrength_game <- player_shifts_data %>%
+          group_by(Player, Player_Id, season, Player_State, Game_Id) %>%
+          summarise(#Games_Played = uniqueN(Game_Id),
+                    
+                Shifts = sum(shift_bool, na.rm = TRUE),
+                #OTF_Shift_Share = sum(OTF_Shift, na.rm = TRUE) / Total_Shifts,
+                #Off_Shift_Share = sum(Off_FO_Shift, na.rm = TRUE) / Total_Shifts,
+                #Def_Shift_Share = sum(Def_FO_Shift, na.rm = TRUE) / Total_Shifts,
+                #Neu_Shift_Share = sum(Neu_FO_Shift, na.rm = TRUE) / Total_Shifts,
+                
+                #ixG60 = sum(ixG, na.rm = TRUE) / (sum(TOI) / 3600),
+                #G60 = sum(G, na.rm = TRUE) / (sum(TOI) / 3600),
+                #P160 = (sum(G, na.rm = TRUE) + sum(A1, na.rm = TRUE)) / (sum(TOI) / 3600),
+                #P60 = (sum(G, na.rm = TRUE) + sum(A1, na.rm = TRUE) + sum(A2, na.rm = TRUE))  / (sum(TOI) / 3600),
+                
+                ixG = sum(ixG, na.rm = TRUE),
+                Goals = sum(G, na.rm = TRUE),
+                Primary_Points  = sum(G, na.rm = TRUE) + sum(A1, na.rm = TRUE),
+                Points = sum(G, na.rm = TRUE) + sum(A1, na.rm = TRUE) + sum(A2, na.rm = TRUE),
+                
+                xGF = sum(xGF, na.rm = TRUE),
+                xGA = sum(xGA, na.rm = TRUE),
+                SF = sum(SF, na.rm = TRUE),
+                SA = sum(SA, na.rm = TRUE),
+                
+                iSF = sum(iSF, na.rm = TRUE),
+
+                #xGF60 = sum(xGF, na.rm = TRUE) / (sum(TOI)/ 3600),
+                #xGA60 = sum(xGA, na.rm = TRUE) / (sum(TOI) / 3600),
+                #SF60 = sum(SF, na.rm = TRUE) / (sum(TOI) / 3600),
+                #SA60 = sum(SA, na.rm = TRUE) / (sum(TOI) / 3600),
+                
+                iPenalty_Drawn = sum(iPenDraw, na.rm = T),
+                iPenalty_Taken = sum(iPenTake, na.rm = T),
+            
+                Mean_Teammates_F = weighted.mean(Mean_Teammates_F, w = TOI),
+                Mean_Teammates_D = weighted.mean(Mean_Teammates_D, w = TOI),
+                Mean_Competition_F = weighted.mean(Mean_Competition_F, w = TOI),
+                Mean_Competition_D = weighted.mean(Mean_Competition_D, w = TOI),
+                
+                Est_TOI = sum(TOI)
+                
+                ) %>%
+          left_join(player_game_toi, by = c("Player","Player_Id", "season", "Game_Id")) %>%
+          group_by(Player, Player_Id, season, Game_Id) %>%
+          mutate(Strength_TOI = Gm_TOI * (Est_TOI / sum(Est_TOI))) %>%
+          select(-c(Est_TOI))
+      
+          return(season_bystrength_game)
+
+}
+
+
+sm_shift <- skater_season_stats(i, szns = c("20162017"))
+
+```
+
+## Season Data
+
+```{r}
+
+skater_list1417 <- skater_id_list %>% filter(season %in% c("20142015","20152016","20162017")) %>% select(shooterID) %>% unique() 
+
+skater_game_stats_1417 <- plyr::rbind.fill(lapply(FUN=skater_season_stats,skater_list1417$shooterID,szns = c("20142015","20152016","20162017")))
+
+save(skater_game_stats_1417, file="~/Documents/CWA/Hockey Data/skater_game_stats_1417.RData")
+
+skater_list_18 <- skater_id_list %>% filter(season %in% c("20172018")) %>% select(shooterID) %>% unique() 
+
+skater_game_stats_18 <- plyr::rbind.fill(lapply(FUN=skater_season_stats,skater_list_18$shooterID,szns = c("20172018")))
+
+save(skater_game_stats_18, file="~/Documents/CWA/Hockey Data/skater_game_stats_18.RData")
+
+
+```
+```{r}
+
+
+```
+
+### Join CrowdScout Score, Break Season into Chunk
+
+```{r}
+
+skater_game_stats <- skater_game_stats_1417 %>%
+          bind_rows(skater_game_stats_18)
+          group_by(Player, Player_Id, season) %>%
+          mutate(Season_Game_Cnt = uniqueN(Game_Id)) %>%
+          filter(Season_Game_Cnt >= 10)
+player
+
+
+       Total_Goals = sum(Goals),
+                 Total_ixG60 = sum(ixG),
+                 Total_Primary_Points = sum(Primary_Points),
+                 Total_GP = max(Games_Played),
+                 Total_TOI_perGame = Total_TOI / Total_GP,
+                 Total_iPenalty_Drawn = sum(iPenalty_Drawn),
+                 Total_iPenalty_Taken = sum(iPenalty_Taken),
+                 TOI_perGame = (TOI / 60) / Total_GP) %>%
+          select(-c(Games_Played)) %>%
+          melt(id.vars = c("Player", "Player_Id", "season","Player_State", "Total_TOI", "Total_TOI_perGame","Total_Goals", "Total_ixG60", "Total_Primary_Points", "Total_GP", "Total_iPenalty_Drawn", "Total_iPenalty_Taken")) %>%
+          mutate(variable = paste0(Player_State,"_",variable)) %>%
+          dcast(Player + Player_Id + season + Total_GP + Total_TOI + Total_TOI_perGame + Total_Goals + Total_ixG60 + Total_Primary_Points + Total_iPenalty_Drawn + Total_iPenalty_Taken ~ variable, value.var = "value")
+
+
+```
