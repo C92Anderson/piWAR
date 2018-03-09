@@ -419,23 +419,16 @@ skater_season_stats <- function(i,szns = c("20142015","20152016","20162017","201
 
       season_bystrength_game <- player_shifts_data %>%
           group_by(Player, Player_Id, season, Player_State, Game_Id) %>%
-          summarise(#Games_Played = uniqueN(Game_Id),
-                    
+          summarise(                
                 Shifts = sum(shift_bool, na.rm = TRUE),
-                #OTF_Shift_Share = sum(OTF_Shift, na.rm = TRUE) / Total_Shifts,
-                #Off_Shift_Share = sum(Off_FO_Shift, na.rm = TRUE) / Total_Shifts,
-                #Def_Shift_Share = sum(Def_FO_Shift, na.rm = TRUE) / Total_Shifts,
-                #Neu_Shift_Share = sum(Neu_FO_Shift, na.rm = TRUE) / Total_Shifts,
-                
-                #ixG60 = sum(ixG, na.rm = TRUE) / (sum(TOI) / 3600),
-                #G60 = sum(G, na.rm = TRUE) / (sum(TOI) / 3600),
-                #P160 = (sum(G, na.rm = TRUE) + sum(A1, na.rm = TRUE)) / (sum(TOI) / 3600),
-                #P60 = (sum(G, na.rm = TRUE) + sum(A1, na.rm = TRUE) + sum(A2, na.rm = TRUE))  / (sum(TOI) / 3600),
-                
+
                 ixG = sum(ixG, na.rm = TRUE),
                 Goals = sum(G, na.rm = TRUE),
                 Primary_Points  = sum(G, na.rm = TRUE) + sum(A1, na.rm = TRUE),
                 Points = sum(G, na.rm = TRUE) + sum(A1, na.rm = TRUE) + sum(A2, na.rm = TRUE),
+                
+                GF = sum(GF, na.rm = TRUE),
+                GA = sum(GA, na.rm = TRUE),
                 
                 xGF = sum(xGF, na.rm = TRUE),
                 xGA = sum(xGA, na.rm = TRUE),
@@ -444,11 +437,6 @@ skater_season_stats <- function(i,szns = c("20142015","20152016","20162017","201
                 
                 iSF = sum(iSF, na.rm = TRUE),
 
-                #xGF60 = sum(xGF, na.rm = TRUE) / (sum(TOI)/ 3600),
-                #xGA60 = sum(xGA, na.rm = TRUE) / (sum(TOI) / 3600),
-                #SF60 = sum(SF, na.rm = TRUE) / (sum(TOI) / 3600),
-                #SA60 = sum(SA, na.rm = TRUE) / (sum(TOI) / 3600),
-                
                 iPenalty_Drawn = sum(iPenDraw, na.rm = T),
                 iPenalty_Taken = sum(iPenTake, na.rm = T),
             
@@ -470,13 +458,13 @@ skater_season_stats <- function(i,szns = c("20142015","20152016","20162017","201
 }
 
 
-sm_shift <- skater_season_stats(i, szns = c("20162017"))
+sm_shift <- skater_season_stats(8477497, szns = c("20162017"))
 
 ```
 
 ## Season Data
 
-```{r}
+```{r echo=FALSE}
 
 skater_list1417 <- skater_id_list %>% filter(season %in% c("20142015","20152016","20162017")) %>% select(shooterID) %>% unique() 
 
@@ -501,12 +489,36 @@ save(skater_game_stats_18, file="~/Documents/CWA/Hockey Data/skater_game_stats_1
 
 ```{r}
 
+min_chunk_games <- 20
+
 skater_game_stats <- skater_game_stats_1417 %>%
-          bind_rows(skater_game_stats_18)
+          bind_rows(skater_game_stats_18) %>%
+          melt(id.vars = c("Player", "Player_Id", "season", "Game_Id", "Gm_TOI","Player_State")) %>%
+          filter(Player_State != "PS") %>%
+          mutate(variable = paste0(Player_State,"_",variable)) %>%
+          dcast(Player + Player_Id + season + Game_Id + Gm_TOI ~ variable)
+
+for(i in 1:10) {
+  print(i)
+}
+
+skater_gamechunk_stats <- skater_game_stats %>%
+           filter(Player_Id == 8477497) %>%
           group_by(Player, Player_Id, season) %>%
-          mutate(Season_Game_Cnt = uniqueN(Game_Id)) %>%
-          filter(Season_Game_Cnt >= 10)
-player
+          mutate(Season_Game_Cnt = uniqueN(Game_Id),
+                 Player_Chunks = floor(Season_Game_Cnt / min_chunk_games),
+                 Game_Chunk = ceiling(runif(n(), 0,Player_Chunks))) %>%
+          filter(Season_Game_Cnt >= 10) %>%
+          group_by(Player, Player_Id, season, Game_Chunk) %>%
+          summarise_at(vars(contains("Goals"),
+                            contains("Drawn"),
+                            ), sum, na.rm = TRUE)
+         
+
+#,"Drawn","Taken","SF","SA","ixG","Points","Shifts","GA","GF"
+
+
+sm_check2 <- skater_game_stats %>% group_by(season, Season_Game_Cnt, Game_Chunk) %>% summarise(cnt = n())
 
 
        Total_Goals = sum(Goals),
