@@ -3,35 +3,20 @@
 ## Load current elo ratings
 
 ```{r echo=FALSE}
-library(ggplot2);library(dplyr); library(DataCombine); library(xgboost)
-library(glmnet);library(caret); library(RMySQL); library(readr); library(reshape2); 
-library(data.table); library(reshape2)
+library(dplyr); library(data.table)
 
-
-conn <- dbConnect(MySQL(), user='ca_elo_games', password='cprice31!',
-                  host='mysql.crowdscoutsports.com', db='nhl_all')
-on.exit(dbDisconnect(conn))
-
-## Get prior player level predictions
-crowdscout_data_predictions <- dbGetQuery(conn, "SELECT *
-                         FROM crowdscout_data_predictions")
-
-#save(crowdscout_data_predictions, file="~/Documents/CWA/Hockey Data/crowdscout_data_predictions.RData")
-#save(player_elo, file="~/Documents/CWA/Hockey Data/player_elo.RData")
-
-detach("package:RMySQL", unload=TRUE)
 ```
 
 ## Create raw PBP
 
-```{r}
+```{r echo=FALSE}
 
 read_raw_pbp <- function(file_year) {
   
   raw_pbp <- read.csv(paste0("~/Documents/CWA/HockeyScrape/nhl_pbp",file_year,".csv")) %>%
           mutate(season = file_year) %>%
           select(-ends_with("X"), -starts_with("Unnam"))
-  
+          
   return(raw_pbp)
 
 }
@@ -39,7 +24,12 @@ read_raw_pbp <- function(file_year) {
 read_raw_shift <- function(file_year) {
   
   raw_shift <- read.csv(paste0("~/Documents/CWA/HockeyScrape/nhl_shifts",file_year,".csv")) %>%
-          mutate(season = file_year) %>%
+          mutate(season = file_year,
+                 Team = ifelse(Team == "SJS","S.J",
+                        ifelse(Team == "TBL","T.B",
+                        ifelse(Team == "LAK","L.A",
+                        ifelse(Team == "NJD","N.J",
+                               as.character(Team)))))) %>%
           select(-ends_with("X"), -ends_with("Date"), -starts_with("Unnam")) %>%
           mutate(Game_Id = ifelse(nchar(Game_Id) > 6, as.integer(substr(Game_Id,6,11)), as.integer(Game_Id)))
   
@@ -79,15 +69,15 @@ season_blocks <- c('2015_2016','2017_2018')
 
 scored_data <- do.call(dplyr::bind_rows,lapply(FUN=read_xG_scored,season_blocks))
 
-
+print("Done")
 ```
 
 ## Load Scored Data and Create Master PBP
 
-```{r}
+```{r echo=FALSE}
 
 ### Join xG to all PBP data
-player_data <- pbp_all_raw %>% 
+player_onice_data <- pbp_all_raw %>% 
             select(-c(xC, yC, Description)) %>% ## drop some duplicates
             unique() %>%
   mutate(Event = ifelse(Event %in% c("GIVE","TAKE"),"TURN",as.character(Event)),
@@ -108,8 +98,64 @@ player_data <- pbp_all_raw %>%
   mutate(event_index = row_number())
   
 ### Standardize Player Names
-player_names <- player_data  %>%
+player_names <- player_onice_data  %>%
    select(starts_with("homePlayer"), starts_with("awayPlayer"), Away_Goalie,Away_Goalie_Id,Home_Goalie,Home_Goalie_Id, p1_name, p2_name, p3_name,p1_ID, p2_ID, p3_ID, season) 
+
+```
+
+## Readin Shift Files by Team
+
+```{r}
+
+team_info <- feather::read_feather(paste0("/Users/colander1/anaconda3/lib/python3.6/site-packages/scrapenhl2/data/other/TEAM_INFO.feather")) %>%
+         mutate(Team = ifelse(Abbreviation == "SJS","S.J",
+                        ifelse(Abbreviation == "TBL","T.B",
+                        ifelse(Abbreviation == "LAK","L.A",
+                        ifelse(Abbreviation == "NJD","N.J",
+                               as.character(Abbreviation)))))) %>%
+          select(Team, ID) %>%
+          rename(Team_ID = ID)
+
+read_toi_shift <- function(file_year) {
+  
+  year = file_year
+  
+  read_feather_file <- function(file) {
+
+    file <- paste0("/Users/colander1/anaconda3/lib/python3.6/site-packages/scrapenhl2/data/teams/toi/",year,"/",file)
+    team_toi <- feather::read_feather(file) 
+    return(team_toi)
+  
+  }
+
+  season <- paste0(file_year,file_year+1)
+  print(season)
+  
+  files_list <- list.files(paste0("/Users/colander1/anaconda3/lib/python3.6/site-packages/scrapenhl2/data/teams/toi/",file_year))
+
+  season_team_toi <- plyr::rbind.fill(lapply(FUN=read_feather_file,files_list))
+    
+  season_team_toi2 <- season_team_toi %>% 
+          dplyr::mutate(season = season)
+    
+  return(season_team_toi2)
+}
+  
+season1 <- c(2014:2017)
+
+
+all_team_toi <- plyr::rbind.fill(lapply(FUN=read_toi_shift,season1))
+
+all_team_toi <- all_team_toi %>%
+        inner_join(team_info, by = c("FocusTeam" = "Team_ID")) %>%
+        mutate(Game_Id = as.integer(Game)) %>%
+        select(-c(Game))
+  
+dat2 <- all_team_toi %>% filter(season == "20142015" & Game_Id == 20001)
+
+
+print("Done")
+
 
 ```
 
@@ -156,29 +202,140 @@ skater_id_list <- as.data.frame(rbind(
               select(-c(cnt, Pos2)) %>%
               distinct() %>%
               anti_join(goalie_id_list, by = c("shooterID" = "goalieID"))
-  
+
+colnames(all_team_toi)
+
+all_team_toi_deduped <- all_team_toi %>%
+        mutate(homePlayer1_id = ifelse(FocusTeam == Home, Team1, Opp1),
+               homePlayer2_id = ifelse(FocusTeam == Home, Team2, Opp2),
+               homePlayer3_id = ifelse(FocusTeam == Home, Team3, Opp3),
+               homePlayer4_id = ifelse(FocusTeam == Home, Team4, Opp4),
+               homePlayer5_id = ifelse(FocusTeam == Home, Team5, Opp5),
+               homePlayer6_id = ifelse(FocusTeam == Home, Team6, Opp6),
+               homePlayer6_id = ifelse(FocusTeam == Home, Team6, Opp6),
+               Home_Goalie_Id = ifelse(FocusTeam == Home, TeamG, OppG),
+               
+               awayPlayer1_id = ifelse(FocusTeam != Home, Team1, Opp1),
+               awayPlayer2_id = ifelse(FocusTeam != Home, Team2, Opp2),
+               awayPlayer3_id = ifelse(FocusTeam != Home, Team3, Opp3),
+               awayPlayer4_id = ifelse(FocusTeam != Home, Team4, Opp4),
+               awayPlayer5_id = ifelse(FocusTeam != Home, Team5, Opp5),
+               awayPlayer6_id = ifelse(FocusTeam != Home, Team6, Opp6),
+               Away_Goalie_Id = ifelse(FocusTeam != Home, TeamG, OppG),
+               
+               TeamStrength = ifelse(TeamStrength %in% c("1+1","2+1","3+1","4+1","5+1"),
+                                            as.numeric(substr(TeamStrength,1,1)) + 1,
+                                            TeamStrength),
+               OppStrength = ifelse(OppStrength %in% c("1+1","2+1","3+1","4+1","5+1"),
+                                            as.numeric(substr(OppStrength,1,1)) + 1,
+                                            OppStrength),
+               #TeamStrength = ifelse(TeamStrength < 3, NA, TeamStrength),
+               #OppStrength = ifelse(OppStrength < 3, NA, OppStrength),
+
+               #TeamStrength = zoo::na.locf(TeamStrength),
+               #OppStrength = zoo::na.locf(OppStrength),
+                              
+                Home_Game_State = ifelse(FocusTeam == Home,
+                                        paste0(TeamStrength,"v",OppStrength),
+                                        paste0(OppStrength,"v",TeamStrength)),
+              
+                TeamScore = ifelse(is.na(TeamScore),0,TeamScore), 
+                OppScore = ifelse(is.na(OppScore),0,OppScore), 
+              
+                Home_Score = ifelse(FocusTeam == Home,
+                                        paste0(TeamScore,"v",OppScore),
+                                        paste0(OppScore,"v",TeamScore))
+               ) %>%
+        select(c(season, Game_Id, Time, Home_Game_State, Home_Score), 
+                  starts_with("homePlayer"),
+                  starts_with("awayPlayer"),
+                  c(Home_Goalie_Id, Away_Goalie_Id)
+               
+              ) %>%
+        distinct()
+
+all_team_toi_deduped %>% group_by(Home_Game_State) %>% summarise(cnt = n())
+
 ```
+
+### Shift Data
+
+```{r}
+
+schedule <- pbp_all_raw %>% select(season, Game_Id, Home_Team, Away_Team) %>% distinct()
+
+season_toi_function <- function(season) {
+
+  game_toi_function <- functin(game) {
+    
+      game_df <- shift_data %>% filter(Game_Id == game) %>% 
+                select(-c(X)) %>%
+                inner_join(schedule, by = c("season","Game_Id"))
+      
+      rows = game_df %>% summarise(Game_End = max(seconds_elapsed))
+      
+      game_seconds <- data.frame(Game_Id = game, matrix(, nrow=rows$Game_End, ncol=0)) %>%
+                  mutate(seconds_elapsed = row_number() - 1)
+      
+      game_df_long <- sqldf::sqldf("
+                        SELECT b.season, a.Game_Id, a.seconds_elapsed, Period, b.Player, Player_Id, Start, End, Duration,
+                                    CASE WHEN Home_Team == Team AND c.goalieID IS NOT NULL THEN 'Home_Goalie_Id' 
+                                         WHEN Home_Team != Team AND c.goalieID IS NOT NULL THEN 'Away_Goalie_Id' 
+                                         WHEN Home_Team == Team AND c.goalieID IS NULL THEN 'homePlayer' 
+                                         WHEN Home_Team != Team AND c.goalieID IS NULL THEN 'awayPlayer' 
+                                    ELSE '' END AS Player_Type, Team, Home_Team, Away_Team, Pos_Spot
+                        FROM game_seconds as a
+                        LEFT JOIN game_df as b
+                        ON b.Start <= a.seconds_elapsed
+                        AND a.seconds_elapsed < b.End
+                        LEFT JOIN goalie_id_list as c
+                        ON b.Player_Id = c.goalieID
+                        AND b.season = c.season
+                        LEFT JOIN skater_id_list as d
+                        ON b.Player_Id = d.shooterID
+                        AND b.season = d.season
+                    ") %>%
+        arrange(season, Game_Id, Period, seconds_elapsed, Player_Type, Pos_Spot) %>%
+        group_by(season, Game_Id, Period, seconds_elapsed, Player_Type) %>%
+        mutate(Player_Type2 = ifelse(Player_Type %in% c("homePlayer","awayPlayer"), paste0(Player_Type, row_number(),"_id"), Player_Type)) %>%
+        
+        dcast(season + Game_Id + Period + seconds_elapsed + Home_Team + Away_Team ~ Player_Type2, value.var = "Player_Id") %>%
+        group_by(season, Game_Id, Period, Home_Team, Away_Team, awayPlayer1_id, awayPlayer2_id, awayPlayer3_id, awayPlayer4_id, awayPlayer5_id, awayPlayer6_id, homePlayer1_id, homePlayer2_id, homePlayer3_id, homePlayer4_id, homePlayer5_id, homePlayer6_id) %>%
+        summarise(Shift_Shift = min(seconds_elapsed),
+                  Shift_Duration = n()) 
+  }
+    
+  shift_data <-  read.csv(paste0("~/Documents/CWA/HockeyScrape/nhl_shifts",season,".csv")) %>%
+      mutate(seconds_elapsed = ((Period - 1) * 1200 ) + End,
+             Start = ((Period - 1) * 1200 ) + Start,
+             End = ((Period - 1) * 1200 ) + End,
+             season = as.numeric(paste0(substr(Game_Id,1,4),as.integer(substr(Game_Id,1,4))+1)),
+             Game_Id = as.integer(substr(Game_Id,6,10)))
+  
+  
+  game_list <- shift_data %>% select(Game_Id) %>% distinct() %>% head()
+  
+  
+
+    
+}
+ 
+
+season_toi_function(20142015) 
+
+
+```
+
 
 ## Quality of Teammates/Competition
 
 ```{r}
-player_level_quality <- crowdscout_data_predictions[c("shooterID","season","Pos","Predicted.CS")] %>%
-                    mutate(shooterID = as.integer(shooterID)) %>%
-                    right_join(skater_id_list, by = c("shooterID","season")) %>%
-                    arrange(shooterID, as.factor(season)) %>%
-                    group_by(shooterID) %>%
-                    tidyr::fill(Pos, Predicted.CS) %>%
-                    rename(Predicted_CS = Predicted.CS) %>%
-                    mutate(Pos = ifelse(!is.na(Pos),as.character(Pos),
-                                 ifelse(Pos_Spot > 3.5, "D","F")),
-                           Predicted_CS = ifelse(is.na(Predicted_CS),35,Predicted_CS)) %>%
-                    select(-c(Pos_Spot, Player))
 
-save(player_level_quality, file="~/Documents/CWA/Hockey Data/player_level_quality.RData")
+load("~/Documents/CWA/Hockey Data/player_level_quality.RData")
 
 
-quality_onice <- as.data.frame(season = as.factor(player_data$season), Game_Id = player_data$Game_Id, player_names, Duration = player_data$Duration) %>%
-  select(-c(Away_Goalie,Home_Goalie, p1_name, p2_name, p3_name)) %>%
+quality_onice <- all_team_toi_deduped %>%
+  select(-c(Away_Goalie_Id,Home_Goalie_Id)) %>%
   ## H1
   left_join(player_level_quality, by = c("homePlayer1_id" = "shooterID", "season" = "season")) %>%
   rename(homePlayer1_elo = Predicted_CS, homePlayer1_Pos = Pos) %>%
@@ -224,33 +381,55 @@ quality_onice_elos <- quality_onice %>%
 ## Clean Data with shift by shift elos  
 
 ```{r}
-player_data_clean <- player_data %>% 
-      select(event_index, Game_Id, Date, Period, Ev_Team, Home_Team, Away_Team, Home_Zone, Event, Seconds_Elapsed, xG_team, xG, Home_Team, Away_Team, Home_Score, Away_Score, Home_Players, Away_Players, Home_Coach, Away_Coach) %>%
-      cbind(player_names, quality_onice_elos) %>%
-      as.data.frame() %>%
-      ungroup() %>%
-      mutate(season = as.integer(as.character(season)),
-            Home_Game_State0 = paste0(Home_Players,"v",Away_Players)
-            ) %>%
-      ## if back-to-back events, set last event back 0.5 second for merge
-      group_by(season, Game_Id, Period) %>%
-      mutate(Seconds_Clean = ifelse(Seconds_Elapsed == lead(Seconds_Elapsed), Seconds_Elapsed - 0.5,
-                                 ifelse(Seconds_Elapsed == lag(Seconds_Elapsed),Seconds_Elapsed + 0.5, Seconds_Elapsed))) %>%
+
+player_onice_data_clean <- all_team_toi_deduped %>%
       group_by(season, Game_Id) %>%
-      mutate(Home_Game_State = ifelse(Home_Game_State0 %in% c("3v5","3v4","3v6","4v5","4v6","5v6","4v5","6v7"),"SH",
-                               ifelse(Home_Game_State0 %in% c("6v3","6v4","5v3","6v5","5v4","4v3"),"PP",
-                               ifelse(Home_Game_State0 %in% c("5v5","6v6","4v4","3v3"),"EV",
-                               ifelse(Home_Game_State0 %in% c("1v1","0v1","1v0"),"PS",
-                               ifelse(lag(Home_Game_State0,1) %in% c("3v5","3v4","3v6","4v5","4v6","5v6","4v5"),"SH",
-                               ifelse(lag(Home_Game_State0,1) %in% c("6v3","6v4","5v3","6v5","5v4","4v3"),"PP",
-                               ifelse(lag(Home_Game_State0,1) %in% c("5v5","6v6","4v4","3v3"),"EV",
-                                        "EV"))))))))
+      mutate(Sec = row_number()) %>%
+      left_join(
+              player_onice_data %>% 
+              select(event_index, season, Game_Id, Date, Period, Ev_Team, Home_Team, Away_Team, Home_Zone, Event, Seconds_Elapsed, xG_team, xG, Home_Coach, Away_Coach, Strength, Away_Players, Home_Players) %>%
+              filter(Ev_Team != "") %>%
+              distinct() %>%
+              mutate(Time = ((Period - 1) * 1200 ) + Seconds_Elapsed), 
+            by = c("season", "Game_Id", "Time")) %>%
+             #season = as.integer(as.character(season)),
+             mutate(Home_Game_State_PBP = paste0(Home_Players,"v",Away_Players),
+                    Home_Game_State = ifelse(Home_Game_State %in% c("5v5","6v6","4v4","3v3"),"EV",
+                                            ifelse(Home_Game_State %in% c("6v3","6v4","5v3","6v5","5v4","4v3"),"PP",
+                                            ifelse(Home_Game_State %in% c("3v5","3v4","3v6","4v5","4v6","5v6","4v5","6v7"),"SH",
+                                            
+                               NA)))
+                    #Home_Game_State1 = zoo::na.locf(Home_Game_State)
+                    ) 
+
+player_onice_data_clean1 <- player_onice_data_clean %>%
+      group_by(season, Game_Id) %>%
+      tidyr::fill(Home_Game_State) %>%
+      mutate(Duration = ifelse(is.na(Sec - lag(Sec)),1, Sec - lag(Sec)),
+             Period = ceiling((Sec + 1) / 1200)) %>%
+       group_by(season, Game_Id, Home_Game_State, Home_Score, Home_Team, Away_Team, awayPlayer1_id, awayPlayer2_id,awayPlayer3_id ,awayPlayer4_id ,awayPlayer5_id ,awayPlayer6_id ,homePlayer1_id ,homePlayer2_id ,homePlayer3_id ,homePlayer4_id ,homePlayer5_id ,homePlayer6_id, 
+                event_index, Date, Period, Ev_Team, Home_Zone, Event, xG_team, xG, Home_Coach, Away_Coach, Home_Game_State_PBP, Home_Game_State, Away_Players, Home_Players) %>%
+       summarise(Duration = sum(Duration),
+                 Start_Time = min(Sec))
+ 
+
+
+nrow(all_team_toi_deduped) - sum(player_onice_data_clean1$Duration, na.rm=T)
+
+# save(player_onice_data_clean, file="~/Documents/CWA/Hockey Data/player_onice_data_clean.RData")
+
+dat1 <- player_onice_data_clean1 %>% filter(season == "20142015" & Game_Id == 20001)
+
+ps <- player_onice_data_clean %>% filter(!Home_Game_State %in% c("SH","EV","PP"))
+
+cnts <- player_onice_data_clean %>% group_by(Home_Game_State) %>% summarise(cnt = n()) %>% arrange(-cnt)
 
 ```
 
 ### Player Function
 
 ```{r}
+
 
 skater_season_stats <- function(i,szns = c("20142015","20152016","20162017","20172018")) {
     
@@ -259,11 +438,20 @@ skater_season_stats <- function(i,szns = c("20142015","20152016","20162017","201
     print(player_name)
 
     ### Player On-Ice For Events
-    player_onice <- tryCatch(player_data_clean %>%
+    player_onice <- tryCatch(player_onice_data_clean %>%
           filter(season %in% szns) %>%
           filter(awayPlayer1_id %in% c(i) | awayPlayer2_id %in% c(i) | awayPlayer3_id %in% c(i) | awayPlayer4_id %in% c(i) | awayPlayer5_id %in% c(i) | awayPlayer6_id %in% c(i) | homePlayer1_id %in% c(i) | homePlayer2_id %in% c(i) | homePlayer3_id %in% c(i) | homePlayer4_id %in% c(i) | homePlayer5_id %in% c(i) | homePlayer6_id %in% c(i) ) %>%
           mutate(Player = as.factor(player_name),
-                 Player_Id = i))
+                 Player_Id = i,
+                 Team = ifelse(awayPlayer1_id %in% c(i) | awayPlayer2_id %in% c(i) | awayPlayer3_id %in% c(i) | awayPlayer4_id %in% c(i) | awayPlayer5_id %in% c(i) | awayPlayer6_id %in% c(i), Away_Team, Home_Team),
+                  Player_State = ifelse(Team == Home_Team | Home_Game_State == "EV",Home_Game_State,
+                   ifelse(Home_Game_State == "SH" & Team != Home_Team,"PP",
+                   ifelse(Home_Game_State == "PP" & Team != Home_Team,"SH",
+                          "EV")))))
+          
+      player_game_toi <- player_onice %>%
+            group_by(Player, Player_Id, season, Team, Game_Id, Player_State) %>%
+            summarise(TOI = sum(Duration)/60)
 
       ### Player Shift Sums
       player_shifts_data_raw <- tryCatch(shift_all_raw %>%
@@ -277,9 +465,6 @@ skater_season_stats <- function(i,szns = c("20142015","20152016","20162017","201
             group_by(season, Player, Player_Id) %>% 
             mutate(Season_Shift_No = cumsum(shift_bool)))
       
-      player_game_toi <- player_shifts_data_raw %>%
-            group_by(Player, Player_Id, season, Game_Id) %>%
-            summarise(Gm_TOI = sum(Duration)/60)
 
         ### Leaves out shifts with no events
         player_shifts_data <- sqldf::sqldf("
@@ -294,9 +479,11 @@ skater_season_stats <- function(i,szns = c("20142015","20152016","20162017","201
                       AND a.Start <= b.Seconds_Clean
                       AND b.Seconds_Clean <= a.End
                   ") %>%
+          
+        player_shifts_data <- player_onice  %>%
               filter(!is.na(event_index)) %>%
               group_by(Player, Player_Id, season, Game_Id, Period, Season_Shift_No, Game_Shift_No) %>%
-              mutate(Team = as.character(Team),
+              mutate(
                      Player_Venue =  ifelse(Team == Home_Team,"Home","Away"),
                      Ev_Team = as.character(Ev_Team),
                      Player_State = ifelse(Team == Home_Team | Home_Game_State == "EV",Home_Game_State,
@@ -440,6 +627,9 @@ skater_season_stats <- function(i,szns = c("20142015","20152016","20162017","201
                 iPenalty_Drawn = sum(iPenDraw, na.rm = T),
                 iPenalty_Taken = sum(iPenTake, na.rm = T),
             
+                Penalty_Drawn = sum(PenDraw, na.rm = T),
+                Penalty_Taken = sum(PenTake, na.rm = T),
+            
                 Mean_Teammates_F = weighted.mean(Mean_Teammates_F, w = TOI),
                 Mean_Teammates_D = weighted.mean(Mean_Teammates_D, w = TOI),
                 Mean_Competition_F = weighted.mean(Mean_Competition_F, w = TOI),
@@ -458,13 +648,13 @@ skater_season_stats <- function(i,szns = c("20142015","20152016","20162017","201
 }
 
 
-sm_shift <- skater_season_stats(8477497, szns = c("20162017"))
+bb_shift <- skater_season_stats(8470613, szns = c("20172018"))
 
 ```
 
 ## Season Data
 
-```{r echo=FALSE}
+```{r echo=FALSE, results="hide"}
 
 skater_list1417 <- skater_id_list %>% filter(season %in% c("20142015","20152016","20162017")) %>% select(shooterID) %>% unique() 
 
@@ -478,61 +668,454 @@ skater_game_stats_18 <- plyr::rbind.fill(lapply(FUN=skater_season_stats,skater_l
 
 save(skater_game_stats_18, file="~/Documents/CWA/Hockey Data/skater_game_stats_18.RData")
 
-
-```
-```{r}
-
-
+print("Done")
 ```
 
-### Join CrowdScout Score, Break Season into Chunk
+### Join CrowdScout Score, Break Season into Chunks
 
 ```{r}
+load("~/Documents/CWA/Hockey Data/skater_game_stats_1417.RData")
+load("~/Documents/CWA/Hockey Data/skater_game_stats_18.RData")
 
 min_chunk_games <- 20
 
 skater_game_stats <- skater_game_stats_1417 %>%
           bind_rows(skater_game_stats_18) %>%
-          melt(id.vars = c("Player", "Player_Id", "season", "Game_Id", "Gm_TOI","Player_State")) %>%
-          filter(Player_State != "PS") %>%
-          mutate(variable = paste0(Player_State,"_",variable)) %>%
-          dcast(Player + Player_Id + season + Game_Id + Gm_TOI ~ variable)
+          filter(Player_State != "PS")
 
-for(i in 1:10) {
-  print(i)
+skater_stats_chunked <- function(seed) {
+  
+  set.seed(seed)
+
+  skater_gamechunk_grouped <- skater_game_stats %>%
+            group_by(Player, Player_Id, season) %>%
+            mutate(Season_Gm_Cnt = n_distinct(Game_Id),
+                   Player_Chunks = ceiling(Season_Gm_Cnt / min_chunk_games),
+                   Game_Chunk = ceiling(runif(n(), 0,Player_Chunks))) %>%
+            filter(Season_Gm_Cnt >= 10) %>%
+            group_by(Player, Player_Id, season, Game_Chunk) %>%
+            mutate(Sample_Games = n_distinct(Game_Id)) %>%
+            select(-c(Game_Id)) %>%
+            group_by(Player, Player_Id, season, Game_Chunk, Player_State, Sample_Games) 
+
+  skater_gamechunk_qualcomp <- skater_gamechunk_grouped %>%
+            summarise(Mean_Competition_D = weighted.mean(Mean_Competition_D, w=Strength_TOI, na.rm = TRUE),
+                      Mean_Competition_F = weighted.mean(Mean_Competition_F, w=Strength_TOI, na.rm = TRUE),
+                      
+                      Mean_Teammates_D = weighted.mean(Mean_Teammates_D, w=Strength_TOI, na.rm = TRUE),
+                      Mean_Teammates_F = weighted.mean(Mean_Teammates_F, w=Strength_TOI, na.rm = TRUE)
+                      )
+          
+  skater_gamechunk_sums <- skater_gamechunk_grouped %>%
+            summarise_at(vars(ends_with("Goals"),
+                              ends_with("Drawn"),
+                              ends_with("Taken"),
+                              ends_with("SF"),
+                              ends_with("SA"),
+                              ends_with("ixG"),
+                              ends_with("Points"),
+                              ends_with("Shifts"),
+                              ends_with("GF"),
+                              ends_with("GA"),
+                               ends_with("TOI")
+                              ), sum, na.rm = TRUE) %>%
+            left_join(skater_gamechunk_qualcomp, by = c("Player", "Player_Id", "season", "Game_Chunk","Player_State","Sample_Games")) %>%
+            melt(id.vars = c("Player", "Player_Id", "season", "Game_Chunk","Player_State","Sample_Games")) %>%
+            mutate(iteration = seed)
+
+    return(skater_gamechunk_sums)
+}    
+
+
+skater_gamechunk_stats <- do.call(dplyr::bind_rows,lapply(FUN=skater_stats_chunked,c(1:10)))
+
+```
+
+### Function to calculate differentials
+
+```{r}
+load("~/Documents/CWA/Hockey Data/player_onice_data_clean.RData")
+
+### Calculate strength rates
+strength_df <- player_onice_data_clean %>%
+                    filter(Home_Game_State != "PS") %>%
+                    mutate(Home_Sample = ifelse(Ev_Team == Home_Team, 1, 0),
+                            PenDraw = ifelse((Home_Team != Ev_Team) & (Event %in% c("PENL")), 1, 0),
+                            PenTake = ifelse((Home_Team == Ev_Team) & (Event %in% c("PENL")), 1, 0),
+                            SF = ifelse((Home_Team == Ev_Team) & (Event %in% c("SHOT","MISS","BLOCK","GOAL")), 1, 0),
+                            SA = ifelse((Home_Team != Ev_Team) & (Event %in% c("SHOT","MISS","BLOCK","GOAL")), 1, 0),
+                            GF = ifelse((Home_Team == Ev_Team) & (Event %in% c("GOAL")), 1, 0),
+                            GA = ifelse((Home_Team != Ev_Team) & (Event %in% c("GOAL")), 1, 0),
+                            xGF = ifelse((Home_Team == Ev_Team) & (Event %in% c("SHOT","MISS","BLOCK","GOAL")), xG_team, 0),
+                            xGA = ifelse((Home_Team != Ev_Team) & (Event %in% c("SHOT","MISS","BLOCK","GOAL")), xG_team, 0))
+
+strength_df2 <- strength_df %>%
+                    group_by(Home_Sample) %>%
+                    sample_n(size = sum(strength_df$Home_Sample))
+
+strength_rates <- strength_df2 %>%
+                    group_by(Home_Game_State) %>%
+                    summarise(S_Baseline = sum(SF) / (sum(SF) + sum(SA)),
+                              Pen_Baseline = sum(PenDraw) / (sum(PenDraw) + sum(PenTake)),
+                              G_Baseline = sum(GF) / (sum(GF) + sum(GA)),
+                              xG_Baseline = sum(xGF) / (sum(xGF) + sum(xGA))
+                              ) %>%
+                    melt() %>%
+                    dcast(variable ~ Home_Game_State) %>%
+                    mutate(PP = PP / (EV / 0.5),
+                           SH = SH / (EV / 0.5),
+                           EV = 0.5) %>%
+                    melt(variable.name = "Player_State") %>%
+                    dcast(Player_State ~ variable)
+
+load("~/Documents/CWA/Hockey Data/player_level_quality.RData")
+
+
+skater_production_baseline <- skater_game_stats %>%
+        left_join(player_level_quality %>% select(shooterID, Pos) %>% rename(Player_Id = shooterID) %>% distinct(), by = c("Player_Id")) %>%
+        group_by(Player_State, Pos) %>%
+        summarise(mean_pos_ixG60 = sum(ixG) / (sum(Strength_TOI) / 60),
+                  mean_pos_G60 = sum(Goals) / (sum(Strength_TOI) / 60),
+                  mean_pos_Primary_Points60 = sum(Primary_Points) / (sum(Strength_TOI) / 60),
+                  mean_pos_Points60 = sum(Points) / (sum(Strength_TOI) / 60),
+                  mean_pos_TOI = mean(Strength_TOI),
+                  mean_pos_iPenDrawn = sum(iPenalty_Drawn) / (sum(Strength_TOI) / 60),
+                  mean_pos_iPenTaken = sum(iPenalty_Taken) / (sum(Strength_TOI) / 60)
+                  )
+
+
+```
+
+### Create regressed metrics
+
+```{r}
+
+## Beta Functions
+calcBetaMode <- function(aa, bb) { BetaMode <- (aa - 1)/(aa + bb - 2); return(BetaMode); }
+calcBetaMean <- function(aa, bb) { BetaMean <- (aa)/(aa + bb); return(BetaMean); }
+calcBetaSd   <- function(aa, bb) { BetaSd <- sqrt((aa * bb)/(((aa + bb)^2) * (aa + bb + 1))); return(BetaSd); }
+
+
+beta_lift_fun <- function(for_metric, against_metric, TOI, strength_rate, prior = 2000, type = "POST") {
+  
+      
+      beta_a = prior * strength_rate
+      beta_b = prior * (1-strength_rate) #(for_metric + against_metric) - beta_a
+      
+      # Overall
+      likelihood_a = for_metric + 1  ## Saves + 1
+      likelihood_b = against_metric + 1  ## Goals + 1
+      
+      posterior_a = beta_a + (likelihood_a - 1)  ## Success + Beta A
+      posterior_b = beta_b +  (likelihood_b - 1)  ## Goals + Beta B
+
+      prior_mean      = calcBetaMean(beta_a, beta_b)
+      posterior_mean  = calcBetaMean(posterior_a, posterior_b)
+
+      if(type == "POST") {
+          out  = calcBetaMean(posterior_a, posterior_b) - calcBetaMean(beta_a, beta_b)
+        } else {
+          out = calcBetaMean(beta_a, beta_b)
+        }
+
+      return(out)
 }
 
-skater_gamechunk_stats <- skater_game_stats %>%
-           filter(Player_Id == 8477497) %>%
-          group_by(Player, Player_Id, season) %>%
-          mutate(Season_Game_Cnt = uniqueN(Game_Id),
-                 Player_Chunks = floor(Season_Game_Cnt / min_chunk_games),
-                 Game_Chunk = ceiling(runif(n(), 0,Player_Chunks))) %>%
-          filter(Season_Game_Cnt >= 10) %>%
-          group_by(Player, Player_Id, season, Game_Chunk) %>%
-          summarise_at(vars(contains("Goals"),
-                            contains("Drawn"),
-                            ), sum, na.rm = TRUE)
-         
+kr21_regressor <- function(player_value, player_toi, mean_rate, mean_toi, sample_games) {
 
-#,"Drawn","Taken","SF","SA","ixG","Points","Shifts","GA","GF"
+   ## Per game stabilizer
+    total_TOI_over_sample <- mean_toi * sample_games * 0.5
+    
+    out <- (((player_value * player_toi) + (total_TOI_over_sample * mean_rate)) / (player_toi + total_TOI_over_sample))
+    
+    return(out)
+}
+
+#kr21_regressor(0.6, 200, 0.5, 15, 40)
 
 
-sm_check2 <- skater_game_stats %>% group_by(season, Season_Game_Cnt, Game_Chunk) %>% summarise(cnt = n())
+shots_game <- 30
+shooting_pct <- 0.04804833
+pen_shot_ratio <- 0.06903094
 
 
-       Total_Goals = sum(Goals),
-                 Total_ixG60 = sum(ixG),
-                 Total_Primary_Points = sum(Primary_Points),
-                 Total_GP = max(Games_Played),
-                 Total_TOI_perGame = Total_TOI / Total_GP,
-                 Total_iPenalty_Drawn = sum(iPenalty_Drawn),
-                 Total_iPenalty_Taken = sum(iPenalty_Taken),
-                 TOI_perGame = (TOI / 60) / Total_GP) %>%
-          select(-c(Games_Played)) %>%
-          melt(id.vars = c("Player", "Player_Id", "season","Player_State", "Total_TOI", "Total_TOI_perGame","Total_Goals", "Total_ixG60", "Total_Primary_Points", "Total_GP", "Total_iPenalty_Drawn", "Total_iPenalty_Taken")) %>%
-          mutate(variable = paste0(Player_State,"_",variable)) %>%
-          dcast(Player + Player_Id + season + Total_GP + Total_TOI + Total_TOI_perGame + Total_Goals + Total_ixG60 + Total_Primary_Points + Total_iPenalty_Drawn + Total_iPenalty_Taken ~ variable, value.var = "value")
+skater_gamechunk_stats2 <- skater_gamechunk_stats %>%
+   dcast(Player + Player_Id + season + iteration + Game_Chunk + Sample_Games + Player_State ~ variable) %>%
+            left_join(strength_rates, by = "Player_State") %>%
+            left_join(player_level_quality %>% select(shooterID, Pos) %>% rename(Player_Id = shooterID) %>% distinct(), by = c("Player_Id")) %>%
+            left_join(skater_production_baseline, by = c("Player_State","Pos")) %>%
+            mutate(regressed_SF_Share = beta_lift_fun(SF, SA, Strength_TOI, S_Baseline, Sample_Games * shots_game, "POST"),
+                   regressed_GF_Share = beta_lift_fun(GF, GA, Strength_TOI, G_Baseline, Sample_Games * shots_game * shooting_pct, "POST"),
+                   regressed_xGF_Share = beta_lift_fun(xGF, xGA, Strength_TOI, xG_Baseline, Sample_Games * shots_game * shooting_pct, "POST"),
+                   regressed_iPen_Share = beta_lift_fun(iPenalty_Drawn, iPenalty_Taken, Strength_TOI, Pen_Baseline, Sample_Games * shots_game * pen_shot_ratio, "POST"),
+                  regressed_ixG60 = kr21_regressor(ixG, Strength_TOI, mean_pos_ixG60, mean_pos_TOI, Sample_Games),
+                  regressed_G60 = kr21_regressor(Goals, Strength_TOI, mean_pos_G60, mean_pos_TOI, Sample_Games),
+                  regressed_Primary_Points60 = kr21_regressor(Primary_Points, Strength_TOI, mean_pos_Primary_Points60, mean_pos_TOI, Sample_Games),
+                  regressed_Points60 = kr21_regressor(Points, Strength_TOI, mean_pos_Points60, mean_pos_TOI, Sample_Games),
+                  regressed_iPenDrawn60 = kr21_regressor(iPenalty_Drawn, Strength_TOI, mean_pos_iPenDrawn, mean_pos_TOI, Sample_Games),
+                  regressed_iPenTaken60 = kr21_regressor(iPenalty_Taken, Strength_TOI, mean_pos_iPenTaken, mean_pos_TOI, Sample_Games),
+                  Strength_TOI_Gm = Strength_TOI / Sample_Games
+                   ) %>%
+      select(c(Player,Player_Id,season,iteration,Game_Chunk,Sample_Games,Player_State),
+             starts_with("regressed"),
+             starts_with("Strength_TOI_Gm"),
+             starts_with("Mean"),
+             -starts_with("mean_pos")
+             ) %>%
+        melt(id.vars = c("Player","Player_Id","season","iteration","Game_Chunk","Sample_Games","Player_State")) %>%
+        mutate(variable = paste0(variable,"_",Player_State)) %>%
+        dcast(Player + Player_Id + season + iteration + Game_Chunk + Sample_Games ~ variable) %>%
+        mutate_if(is.numeric, funs(replace(., is.na(.), 0)))
+       
+            
+            
+          
+colnames(skater_gamechunk_stats2)
 
+head(skater_gamechunk_stats2$Strength_TOI_EV)
+```
+
+
+## Crowdscout Training Data
+
+```{r}
+
+conn <- RMySQL::dbConnect(RMySQL::MySQL(), user='ca_elo_games', password='cprice31!',
+                  host='mysql.crowdscoutsports.com', db='nhl_all')
+on.exit(dbDisconnect(conn))
+
+player_season_elo <- dbGetQuery(conn, "SELECT ID as Player_Id,
+                         CASE WHEN Date <= '2016-10-01' THEN 20152016
+                              WHEN Date <= '2017-10-01' THEN 20162017
+                              WHEN Date <= '2018-10-01' THEN 20172018
+                              WHEN Date <= '2019-10-01' THEN 20182019
+                              WHEN Date <= '2020-10-01' THEN 20192020
+                              WHEN Date <= '2021-10-01' THEN 20202021 
+                              WHEN Date <= '2022-10-01' THEN 20212022 END AS season, avg(score) as Score
+                         FROM hockey_daily_elo_py AS A
+                         WHERE Date >= '2015-10-01'
+                         GROUP BY 1,2")
+
+player_season_last_elo <- dbGetQuery(conn, "SELECT ID as Player_Id,
+                         CASE WHEN Date <= '2016-10-01' THEN 20152016
+                              WHEN Date <= '2017-10-01' THEN 20162017
+                              WHEN Date <= '2018-10-01' THEN 20172018
+                              WHEN Date <= '2019-10-01' THEN 20182019
+                              WHEN Date <= '2020-10-01' THEN 20192020
+                              WHEN Date <= '2021-10-01' THEN 20202021 
+                              WHEN Date <= '2022-10-01' THEN 20212022 END AS season, cron_ts, score as Last_Score
+                         FROM hockey_daily_elo_py AS A
+                         WHERE Date >= '2015-10-01'
+                         GROUP BY 1,2
+                         HAVING max(cron_ts) OR cron_ts IS NULL") %>% select(-c(cron_ts))
+
+
+load("~/Documents/CWA/Hockey Data/player_level_quality.RData")
+
+skater_gamechunk_stats_elo <- skater_gamechunk_stats2 %>%
+        filter(season != "20142015") %>%
+        inner_join(player_season_elo, by = c("Player_Id", "season")) %>%
+        inner_join(player_season_last_elo, by = c("Player_Id", "season")) %>%
+        left_join(player_level_quality %>% select(shooterID, Pos) %>% rename(Player_Id = shooterID) %>% distinct(), by = c("Player_Id")) %>%
+        na.omit()
+
+dim(skater_gamechunk_stats2 %>% filter(season != "20142015"))
+dim(skater_gamechunk_stats_elo) ## 49650
+
+```
+### Model Player Score
+
+```{r}
+library(xgboost); library(caret)
+model_features <- skater_gamechunk_stats_elo %>% select(-c(Player,Player_Id,season,iteration,Game_Chunk,Sample_Games, Pos), ends_with("Score"))
+
+preProcValues <- caret::preProcess(model_features, method = c("center", "scale"))
+model_data <- predict(preProcValues, model_features) %>%
+        mutate(Pos_F = ifelse(skater_gamechunk_stats_elo$Pos == "F",1,0))
+
+dim(model_data)
+
+lm_model <- glm(skater_gamechunk_stats_elo$Score ~ . , data = model_data)
+
+index <- createDataPartition(skater_gamechunk_stats_elo$Pos, p=0.75, list=FALSE)
+train_data <- xgb.DMatrix(as.matrix(model_data),label=skater_gamechunk_stats_elo[,c("Last_Score")] )
+test_data <- xgb.DMatrix(as.matrix(model_data[-index,]),label=skater_gamechunk_stats_elo[-index,c("Last_Score")] )
+model_dbg <- xgb.DMatrix(as.matrix(model_data[,]),label=skater_gamechunk_stats_elo[,c("Last_Score")] )
+
+bst_model <- xgb.train( params = list(objective = "reg:linear",
+            eta = 0.05,   # step size / shrinkage
+            max_depth = 6,  # Max depth of each tree
+            gamma = 0,    # Minimum loss function for leaf to be split
+            min_child_weight = 20,    # Min number of cases in leaf
+            subsample = 0.3,    # Sample of cases for each tree
+            colsample_bytree = 0.7,  # Ratio of columns to sample
+            missing = NA,
+            stratified = TRUE,
+            nthread = 2,   # maximum number of cores/ threads to use for training
+            early_stopping_rounds = 5,  # set to value of consecutive worse performance to terminate
+            nfold = 5,
+            base_score = mean(skater_gamechunk_stats_elo$Last_Score),
+            prediction = TRUE,
+            verbose = 1, 
+            print_every_n = 25,
+            metrics = "rmse"),
+            train_data, nrounds = 100, list(eval = test_data, train = train_data))
+
+importance_matrix <- xgb.importance(feature_names = colnames(model_data), model = bst_model)
+importance_plot = xgb.plot.importance(importance_matrix)
+
+importance_plot
+
+## Output predicted values
+predicted <- predict(bst_model, model_dbg,type="prob")
+
+```
+
+### Predicted Player Scores
+
+```{r}
+
+player_running_scores <- function(i) {
+
+  skater_games <- skater_game_stats %>%
+            filter(Player_Id == i) 
+
+  skater_games2 <- skater_games %>% select(season,Game_Id) %>% distinct() %>% mutate(game_index = row_number()) %>%
+            left_join(skater_games, by = c("season","Game_Id"))
+
+  running10_sums <- function(index) {
+      
+    game_10 <- skater_games2 %>%
+          filter((game_index >= (index - 10)) & (game_index <= index))
+    
+    game_10_qualcomp <- game_10 %>%
+            group_by(Player, Player_Id, Player_State) %>%
+            summarise(season = max(season),
+                      Game_Index = max(index),
+                      Mean_Competition_D = weighted.mean(Mean_Competition_D, w=Strength_TOI, na.rm = TRUE),
+                      Mean_Competition_F = weighted.mean(Mean_Competition_F, w=Strength_TOI, na.rm = TRUE),
+                      
+                      Mean_Teammates_D = weighted.mean(Mean_Teammates_D, w=Strength_TOI, na.rm = TRUE),
+                      Mean_Teammates_F = weighted.mean(Mean_Teammates_F, w=Strength_TOI, na.rm = TRUE)
+                      )
+
+      game_10_sums <- game_10 %>%
+            group_by(Player, Player_Id, Player_State) %>%
+            summarise_at(vars(ends_with("Goals"),
+                              ends_with("Drawn"),
+                              ends_with("Taken"),
+                              ends_with("SF"),
+                              ends_with("SA"),
+                              ends_with("ixG"),
+                              ends_with("Points"),
+                              ends_with("Shifts"),
+                              ends_with("GF"),
+                              ends_with("GA"),
+                               ends_with("TOI")
+                              ), sum, na.rm = TRUE) %>%
+            left_join(game_10_qualcomp, by = c("Player", "Player_Id","Player_State")) %>%
+            filter(Strength_TOI > 0)
+      
+        return(game_10_sums)
+
+  }
+  
+  game_indices <- 10:max(skater_games2$game_index)
+
+  skater_rolling_average <- do.call(dplyr::bind_rows,lapply(FUN=running10_sums,game_indices))
+
+  return(skater_rolling_average)
+  
+}  
+
+
+
+player_ids <- unique(skater_game_stats$Player_Id)
+
+skater_rolling_averages <- do.call(dplyr::bind_rows,lapply(FUN=player_running_scores,player_ids))
+
+save(skater_rolling_averages, file="~/Documents/CWA/Hockey Data/skater_rolling_averages.RData")
+
+```
+
+
+
+```{r}
+load("~/Documents/CWA/Hockey Data/skater_rolling_averages.RData")
+
+skater_rolling_average2 <- skater_rolling_averages %>%
+            left_join(strength_rates, by = "Player_State") %>%
+            left_join(player_level_quality %>% select(shooterID, Pos) %>% rename(Player_Id = shooterID) %>% distinct(), by = c("Player_Id")) %>%
+            left_join(skater_production_baseline, by = c("Player_State","Pos")) %>%
+            mutate(regressed_SF_Share = beta_lift_fun(SF, SA, Strength_TOI, S_Baseline, 10 * shots_game, "POST"),
+                   regressed_GF_Share = beta_lift_fun(GF, GA, Strength_TOI, G_Baseline, 10 * shots_game * shooting_pct, "POST"),
+                   regressed_xGF_Share = beta_lift_fun(xGF, xGA, Strength_TOI, xG_Baseline, 10 * shots_game * shooting_pct, "POST"),
+                   regressed_iPen_Share = beta_lift_fun(iPenalty_Drawn, iPenalty_Taken, Strength_TOI, Pen_Baseline, 10 * shots_game * pen_shot_ratio, "POST"),
+                  regressed_ixG60 = kr21_regressor(ixG, Strength_TOI, mean_pos_ixG60, mean_pos_TOI, 10),
+                  regressed_G60 = kr21_regressor(Goals, Strength_TOI, mean_pos_G60, mean_pos_TOI, 10),
+                  regressed_Primary_Points60 = kr21_regressor(Primary_Points, Strength_TOI, mean_pos_Primary_Points60, mean_pos_TOI, 10),
+                  regressed_Points60 = kr21_regressor(Points, Strength_TOI, mean_pos_Points60, mean_pos_TOI, 10),
+                  regressed_iPenDrawn60 = kr21_regressor(iPenalty_Drawn, Strength_TOI, mean_pos_iPenDrawn, mean_pos_TOI, 10),
+                  regressed_iPenTaken60 = kr21_regressor(iPenalty_Taken, Strength_TOI, mean_pos_iPenTaken, mean_pos_TOI, 10),
+                  Strength_TOI_Gm = Strength_TOI / 10
+                   ) %>%
+      select(c(Player,Player_Id,season,Player_State,Game_Index,Pos),
+             starts_with("regressed"),
+             starts_with("Strength_TOI_Gm"),
+             starts_with("Mean"),
+             -starts_with("mean_pos")
+             ) %>%
+        melt(id.vars = c("Player","Player_Id","season","Pos","Player_State","Game_Index")) %>%
+        mutate(variable = paste0(variable,"_",Player_State)) %>%
+        dcast(Player + Player_Id + season + Pos + Game_Index ~ variable) %>%
+        mutate_if(is.numeric, funs(replace(., is.na(.), 0))) 
+  
+preProcRolling <- caret::preProcess(skater_rolling_average2, method = c("center", "scale"))
+skater_rolling_data <- predict(preProcRolling, skater_rolling_average2) %>%
+        mutate(Pos_F = ifelse(skater_rolling_average2$Pos == "F",1,0))
+
+predicted <- predict(bst_model,xgb.DMatrix(data.matrix(skater_rolling_data)),type="prob")
+
+
+skater_rolling_average_scores <- skater_rolling_average2 %>%
+        mutate(Predicted_Score = predict(lm_model, skater_rolling_data))  #predicted)
+
+
+ggplot(data = skater_rolling_average_scores, aes(x=predicted)) +
+    geom_density()
+
+colnames(model_features)
+
+skater_rolling_average_scores100 <- skater_rolling_average_scores %>%
+      arrange(-Predicted_Score) %>%
+      head(100)
+
+```
+
+### Plot 
+
+```{r}
+
+i = 8471675
+
+skater_rolling_average_scores100 <- skater_rolling_average_scores %>%
+      arrange(-Predicted_Score) %>%
+      head(100)
+
+
+rolling_game_plot <- skater_rolling_average_scores %>%
+      filter(Player_Id == i) %>%
+      ggplot(aes(x=Game_Index, y = Predicted_Score, color=as.factor(season))) +
+      geom_line() +
+      labs(title = "10-Game Rolling Average",
+           x="Game",
+           y="Estimated Ability (Scaled 0 - 100)") +
+      ylim(0,100)
+
+ggsave(filename=paste0("/Users/colander1/Downloads/rolling_game_plot.png"), plot=rolling_game_plot,  width=18, height=12)
+
+
+
+team_toi <- feather::read_feather("/Users/colander1/anaconda3/lib/python3.6/site-packages/scrapenhl2/data/teams/toi/2017/BOS.feather")
 
 ```
